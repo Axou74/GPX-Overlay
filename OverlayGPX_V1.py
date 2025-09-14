@@ -31,15 +31,18 @@ except Exception:
 MAP_TILE_SERVERS = {
     "Aucun": None,
     "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-    "IGN Satellite": "https://wxs.ign.fr/essentiels/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&STYLE=normal&FORMAT=image/jpeg&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}",
+    "Satellite ESRI": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
-    "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    "OpenSnowMap": [
+        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
 }
 
 # Zoom maximal supporté par chaque fournisseur de tuiles
 MAX_ZOOM = {
     "OpenStreetMap": 19,
-    "IGN Satellite": 19,
+    "Satellite ESRI": 19,
     "CyclOSM (FR)": 19,
     "OpenSnowMap": 18,
 }
@@ -419,6 +422,29 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
         max_zoom=max_zoom,
     )
 
+def render_base_map(width: int, height: int, map_style: str, zoom: int,
+                    lon_c: float, lat_c: float, bg_c: tuple[int, int, int]):
+    """Render a base map for the given style, handling composite layers."""
+    if map_style == "Aucun" or not STATICMAP_AVAILABLE:
+        from PIL import Image
+        return Image.new("RGB", (width, height), bg_c)
+
+    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
+    max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"])
+    center = (lon_c, _clamp_lat(lat_c))
+
+    if isinstance(template, (list, tuple)):
+        base_url, overlay_url = template
+        base_s = make_static_map(width, height, base_url, max_zoom=max_zoom)
+        overlay_s = make_static_map(width, height, overlay_url, max_zoom=max_zoom)
+        base_img = base_s.render(zoom=zoom, center=center).convert("RGBA")
+        overlay_img = overlay_s.render(zoom=zoom, center=center).convert("RGBA")
+        base_img.paste(overlay_img, (0, 0), overlay_img)
+        return base_img.convert("RGB")
+    else:
+        s = make_static_map(width, height, template, max_zoom=max_zoom)
+        return s.render(zoom=zoom, center=center).convert("RGB")
+
 # ---------- Graph helpers ----------
 
 def auto_speed_bounds(speeds: np.ndarray) -> tuple[float, float]:
@@ -741,17 +767,7 @@ def generate_gpx_video(
 
             # Rendu du fond : pile à la taille du viewport
             try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map = Image.new("RGB", (mw, mh), bg_c)
-                else:
-                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
-                    s = make_static_map(
-                        mw,
-                        mh,
-                        template,
-                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
-                    )
-                    base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
+                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c)
             except Exception as e:
                 print(f"Fond carte non dispo, fond uni utilisé (fixe): {e}")
                 base_map = Image.new("RGB", (mw, mh), bg_c)
@@ -930,17 +946,9 @@ def generate_gpx_video(
 
             # Fond "large"
             try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-                else:
-                    template = MAP_TILE_SERVERS.get(map_style, MAP_TILE_SERVERS["OpenStreetMap"])
-                    s = make_static_map(
-                        width_large,
-                        height_large,
-                        template,
-                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
-                    )
-                    base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
+                base_map_img_large = render_base_map(
+                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c
+                )
             except Exception as e:
                 print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
                 base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
@@ -1280,17 +1288,7 @@ def render_first_frame_image(
             zoom = max(1, min(19, base_zoom + zoom_offset))
 
             try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map = Image.new("RGB", (mw, mh), bg_c)
-                else:
-                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
-                    s = make_static_map(
-                        mw,
-                        mh,
-                        template,
-                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
-                    )
-                    base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
+                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c)
             except Exception:
                 base_map = Image.new("RGB", (mw, mh), bg_c)
 
@@ -1339,17 +1337,9 @@ def render_first_frame_image(
             y0_world = cy - height_large / 2.0
 
             try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-                else:
-                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
-                    s = make_static_map(
-                        width_large,
-                        height_large,
-                        template,
-                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
-                    )
-                    base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
+                base_map_img_large = render_base_map(
+                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c
+                )
             except Exception:
                 base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
