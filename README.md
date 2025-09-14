@@ -33,3 +33,15 @@ Personnalisation complète des couleurs
 Disposition libre de chaque élément
 
 📸 Aperçu instantané de la première image avant rendu complet
+
+## Fonds de carte
+
+Certains fournisseurs limitent le niveau de zoom ou imposent des règles d'accès.
+Le programme ajuste automatiquement le niveau de zoom pour éviter les tuiles manquantes
+et envoie un `User-Agent` explicite.
+
+- OpenSnowMap (relief et pistes) : zoom ≤ 18
+- OpenStreetMap, CyclOSM, IGN : zoom ≤ 19
+
+La couche "OpenSnowMap" correspond à un overlay de pistes transparent superposé au
+fond "OpenSnowMap Relief".

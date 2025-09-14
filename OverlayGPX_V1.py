@@ -4,6 +4,7 @@
 
 import math
 import os
+import random
 from datetime import datetime, timedelta
 import sys, time
 import threading
@@ -12,6 +13,7 @@ import imageio.v2 as imageio
 import threading
 
 import imageio.v2 as imageio
+from urllib.parse import urlparse
 
 import gpxpy
 import numpy as np
@@ -30,10 +32,20 @@ except Exception:
 # --- Styles de cartes disponibles ---
 MAP_TILE_SERVERS = {
     "Aucun": None,
-    "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+    "OpenStreetMap": "https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",
     "IGN Satellite": "https://wxs.ign.fr/essentiels/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&STYLE=normal&FORMAT=image/jpeg&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}",
-    "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
+    "CyclOSM (FR)": "https://{s}.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
     "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    "OpenSnowMap Relief": "https://tiles.opensnowmap.org/relief/{z}/{x}/{y}.png",
+}
+
+TILE_USER_AGENT = os.environ.get("GPX_OVERLAY_USER_AGENT", "GPX-Overlay/1.0")
+MAX_ZOOM = {
+    "OpenStreetMap": 19,
+    "IGN Satellite": 19,
+    "CyclOSM (FR)": 19,
+    "OpenSnowMap": 18,
+    "OpenSnowMap Relief": 18,
 }
 
 # --- Réglages géométrie et apparence ---
@@ -359,36 +371,73 @@ def zoom_level_ui_to_offset(level_ui: int) -> int:
     return level_ui - 8
 
 def make_static_map(width: int, height: int, url_template: str):
-    """Return a StaticMap instance with retry logic for CyclOSM tiles."""
+    """Return a StaticMap instance with retry logic, subdomain and headers."""
     from staticmap import StaticMap  # type: ignore
+
+    if "{s}" in url_template:
+        url_template = url_template.replace("{s}", random.choice("abc"))
 
     class RetryingStaticMap(StaticMap):
         def get(self, url, **kwargs):
+            headers = kwargs.pop("headers", {})
+            headers.setdefault("User-Agent", TILE_USER_AGENT)
             try:
-                status, content = super().get(url, **kwargs)
+                status, content = super().get(url, headers=headers, **kwargs)
             except Exception:
                 status, content = 0, None
+            if status in (403, 429):
+                parsed = urlparse(url)
+                alt = f"{parsed.scheme}://tile.openstreetmap.org{parsed.path}"
+                try:
+                    status, content = super().get(alt, headers=headers, **kwargs)
+                except Exception:
+                    status, content = 0, None
             if status == 404 and "tile-cyclosm.openstreetmap.fr" in url:
                 for sub in "abc":
                     alt = url.replace("//a.tile-cyclosm", f"//{sub}.tile-cyclosm")
                     try:
-                        status, content = super().get(alt, **kwargs)
+                        status, content = super().get(alt, headers=headers, **kwargs)
                     except Exception:
                         status, content = 0, None
                     if status == 200:
                         break
-                if status == 404 or status == 0:
-                    alt = url.replace(
-                        "a.tile-cyclosm.openstreetmap.fr/cyclosm",
-                        "tile.openstreetmap.org",
-                    )
+                if status in (404, 0):
+                    alt = url.replace("a.tile-cyclosm.openstreetmap.fr/cyclosm", "tile.openstreetmap.org")
                     try:
-                        status, content = super().get(alt, **kwargs)
+                        status, content = super().get(alt, headers=headers, **kwargs)
                     except Exception:
                         status, content = 0, None
             return status, content
 
     return RetryingStaticMap(width, height, url_template=url_template, padding_x=0, padding_y=0, delay_between_retries=1)
+
+
+def _render_single_layer(style: str, width: int, height: int, center: tuple[float, float], zoom: int):
+    if not STATICMAP_AVAILABLE:
+        return Image.new("RGBA", (width, height), (*BG_COLOR, 255))
+    template = MAP_TILE_SERVERS.get(style)
+    if not template:
+        return Image.new("RGBA", (width, height), (*BG_COLOR, 255))
+    s = make_static_map(width, height, template)
+    max_z = MAX_ZOOM.get(style, 19)
+    z = min(zoom, max_z)
+    while z >= 0:
+        try:
+            return s.render(zoom=z, center=center).convert("RGBA")
+        except Exception:
+            z -= 1
+    return Image.new("RGBA", (width, height), (*BG_COLOR, 255))
+
+
+def render_map_layer(map_style: str, width: int, height: int, center: tuple[float, float], zoom: int):
+    if map_style == "Aucun" or not STATICMAP_AVAILABLE:
+        return Image.new("RGB", (width, height), BG_COLOR)
+    if map_style == "OpenSnowMap":
+        base = _render_single_layer("OpenSnowMap Relief", width, height, center, zoom)
+        overlay = _render_single_layer("OpenSnowMap", width, height, center, zoom)
+        base.alpha_composite(overlay)
+        return base.convert("RGB")
+    return _render_single_layer(map_style, width, height, center, zoom).convert("RGB")
 
 # ---------- Graph helpers ----------
 
@@ -711,15 +760,7 @@ def generate_gpx_video(
             zoom = max(1, min(19, base_zoom + zoom_offset))
 
             # Rendu du fond : pile à la taille du viewport
-            try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map = Image.new("RGB", (mw, mh), bg_c)
-                else:
-                    s = make_static_map(mw, mh, MAP_TILE_SERVERS.get(map_style) or "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
-                    base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
-            except Exception as e:
-                print(f"Fond carte non dispo, fond uni utilisé (fixe): {e}")
-                base_map = Image.new("RGB", (mw, mh), bg_c)
+            base_map = render_map_layer(map_style, mw, mh, (lon_c, _clamp_lat(lat_c)), zoom)
 
             # Projeter la trace au même zoom, repère du viewport fixe
             cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
@@ -894,18 +935,7 @@ def generate_gpx_video(
             y0_world = cy - height_large / 2.0
 
             # Fond "large"
-            try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-                else:
-                    s = make_static_map(
-                        width_large, height_large,
-                        MAP_TILE_SERVERS.get(map_style, MAP_TILE_SERVERS["OpenStreetMap"])
-                    )
-                    base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
-            except Exception as e:
-                print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
-                base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+            base_map_img_large = render_map_layer(map_style, width_large, height_large, (lon_c, _clamp_lat(lat_c)), zoom)
 
             # Trace dans le repère "large"
             x_full = xs_world - x0_world
@@ -1241,14 +1271,7 @@ def render_first_frame_image(
                 zoom_offset = 0
             zoom = max(1, min(19, base_zoom + zoom_offset))
 
-            try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map = Image.new("RGB", (mw, mh), bg_c)
-                else:
-                    s = make_static_map(mw, mh, MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"])
-                    base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
-            except Exception:
-                base_map = Image.new("RGB", (mw, mh), bg_c)
+            base_map = render_map_layer(map_style, mw, mh, (lon_c, _clamp_lat(lat_c)), zoom)
 
             cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
             x0 = cx - mw / 2.0; y0 = cy - mh / 2.0
@@ -1294,18 +1317,7 @@ def render_first_frame_image(
             x0_world = cx - width_large / 2.0
             y0_world = cy - height_large / 2.0
 
-            try:
-                if map_style == "Aucun" or not STATICMAP_AVAILABLE:
-                    base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-                else:
-                    s = make_static_map(
-                        width_large,
-                        height_large,
-                        MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
-                    )
-                    base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
-            except Exception:
-                base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+            base_map_img_large = render_map_layer(map_style, width_large, height_large, (lon_c, _clamp_lat(lat_c)), zoom)
 
             x_full = xs_world - x0_world
             y_full = ys_world - y0_world
