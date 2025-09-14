@@ -247,10 +247,7 @@ def prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration
     interp_times = np.linspace(0.0, float(clip_duration), num=total_frames, endpoint=False)
     interp_lats = interpolate_data(times_seconds, lats, interp_times)
     interp_lons = interpolate_data(times_seconds, lons, interp_times)
-    interp_eles = interpolate_data(times_seconds, eles, interp_times, s=1.0)
-    if interp_eles.size >= 5:
-        kernel = np.ones(5) / 5.0
-        interp_eles = np.convolve(interp_eles, kernel, mode="same")
+    interp_eles = interpolate_data(times_seconds, eles, interp_times)
     interp_speeds = np.clip(
         interpolate_data(times_seconds, speeds, interp_times), 0.0, None
     )
@@ -389,46 +386,6 @@ def auto_speed_bounds(speeds: np.ndarray) -> tuple[float, float]:
         return 0.0, 80.0  # vélo
     return 0.0, float(math.ceil(max_speed / 20.0) * 20.0)  # ski ou autres sports rapides
 
-
-def _nice_number(value: float, round_result: bool) -> float:
-    """Return a "nice" number approximately equal to value.
-    Rounds the number if round_result is True, otherwise takes ceiling."""
-    if value == 0:
-        return 0.0
-    exponent = math.floor(math.log10(abs(value)))
-    fraction = abs(value) / (10 ** exponent)
-    if round_result:
-        if fraction < 1.5:
-            nice_fraction = 1.0
-        elif fraction < 3.0:
-            nice_fraction = 2.0
-        elif fraction < 7.0:
-            nice_fraction = 5.0
-        else:
-            nice_fraction = 10.0
-    else:
-        if fraction <= 1.0:
-            nice_fraction = 1.0
-        elif fraction <= 2.0:
-            nice_fraction = 2.0
-        elif fraction <= 5.0:
-            nice_fraction = 5.0
-        else:
-            nice_fraction = 10.0
-    return math.copysign(nice_fraction * (10 ** exponent), value)
-
-
-def auto_axis_bounds(data_min: float, data_max: float, nb_ticks: int = 4) -> tuple[float, float]:
-    """Compute "nice" axis bounds that include the data range."""
-    if data_max == data_min:
-        data_max += 1.0
-        data_min -= 1.0
-    data_range = _nice_number(data_max - data_min, False)
-    tick_spacing = _nice_number(data_range / nb_ticks, True)
-    graph_min = math.floor(data_min / tick_spacing) * tick_spacing
-    graph_max = math.ceil(data_max / tick_spacing) * tick_spacing
-    return graph_min, graph_max
-
 class GraphTransformer:
     def __init__(self, data_min: float, data_max: float, draw_area: dict):
         self.data_min, self.data_max = float(data_min), float(data_max)
@@ -448,17 +405,11 @@ def draw_graph(
 ):
     # Graduations en ordonnée sous la courbe
     nb_ticks = 4
-    tick_step = (max_val - min_val) / nb_ticks if nb_ticks else 1.0
-    precision = 0
-    if tick_step < 1:
-        precision = 1
-    if tick_step < 0.1:
-        precision = 2
     for i in range(nb_ticks + 1):
-        val = min_val + tick_step * i
+        val = min_val + (max_val - min_val) * i / nb_ticks
         y = draw_area["y"] + int((max_val - val) / ((max_val - min_val) + 1e-10) * draw_area["height"])
         draw.line([(draw_area["x"], y), (draw_area["x"] + draw_area["width"], y)], fill=(80, 80, 80), width=1)
-        val_str = f"{val:.{precision}f}"
+        val_str = f"{val:.0f}"
         text_bbox = draw.textbbox((0, 0), val_str, font=font)
         text_w = text_bbox[2] - text_bbox[0]
         text_h = text_bbox[3] - text_bbox[1]
@@ -473,10 +424,9 @@ def draw_graph(
             fill=current_point_color,
         )
 
-    min_str = f"{min_val:.{precision}f}"
-    max_str = f"{max_val:.{precision}f}"
-    draw.text((draw_area["x"], draw_area["y"] + draw_area["height"] + 10), f"Min {title}: {min_str} {unit}", font=font, fill=text_color)
-    draw.text((draw_area["x"] + draw_area["width"] - 200, draw_area["y"] + draw_area["height"] + 10), f"Max {title}: {max_str} {unit}", font=font, fill=text_color)
+    # Légendes min/max (entiers pour rester simple)
+    draw.text((draw_area["x"], draw_area["y"] + draw_area["height"] + 10), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
+    draw.text((draw_area["x"] + draw_area["width"] - 200, draw_area["y"] + draw_area["height"] + 10), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
 
 def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     x0, y0 = draw_area["x"], draw_area["y"]
@@ -675,9 +625,8 @@ def generate_gpx_video(
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
     # Profils (altitude & vitesse)
-    elev_data_min = float(np.min(interp_eles))
-    elev_data_max = float(np.max(interp_eles))
-    elev_min, elev_max = auto_axis_bounds(elev_data_min, elev_data_max)
+    elev_min = float(np.min(interp_eles))
+    elev_max = float(np.max(interp_eles))
     elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
     elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
 
@@ -1169,9 +1118,8 @@ def render_first_frame_image(
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
-    elev_data_min = float(np.min(interp_eles))
-    elev_data_max = float(np.max(interp_eles))
-    elev_min, elev_max = auto_axis_bounds(elev_data_min, elev_data_max)
+    elev_min = float(np.min(interp_eles))
+    elev_max = float(np.max(interp_eles))
     elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
     elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
 
