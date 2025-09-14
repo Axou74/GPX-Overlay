@@ -15,6 +15,7 @@ OverlayGPX est une application Python qui transforme un fichier GPX en une vidé
 ❤️ Profil de fréquence cardiaque
 
 ⚡ Jauge de vitesse en temps réel
+🔁 Plusieurs styles de jauge (circulaire, linéaire, compteur)
 
 📝 Bloc d’infos en direct : vitesse, altitude, heure, pente, allure, FC
 
@@ -26,7 +27,11 @@ OverlayGPX est une application Python qui transforme un fichier GPX en une vidé
 
 Choix de la résolution et des FPS
 
+Choix de la police et de sa taille
+
 Choix du style de carte et niveau de zoom (1 à 12)
+
+Support d'OpenSnowMap pour les fonds de carte
 
 Personnalisation complète des couleurs
 
