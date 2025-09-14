@@ -33,6 +33,7 @@ MAP_TILE_SERVERS = {
     "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "IGN Satellite": "https://wxs.ign.fr/essentiels/geoportail/wmts?REQUEST=GetTile&SERVICE=WMTS&VERSION=1.0.0&STYLE=normal&FORMAT=image/jpeg&LAYER=ORTHOIMAGERY.ORTHOPHOTOS&TILEMATRIXSET=PM&TILEMATRIX={z}&TILEROW={y}&TILECOL={x}",
     "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
+    "OpenSnowMap": "https://tile.opensnowmap.org/pistes/{z}/{x}/{y}.png",
 }
 
 # --- Réglages géométrie et apparence ---
@@ -91,12 +92,26 @@ DEFAULT_ELEMENT_CONFIGS = {
         "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
         "height": 150,
     },
-    "Jauge Vitesse": {
+    "Jauge Vitesse Circulaire": {
         "visible": True,
         "x": MARGIN,
         "y": DEFAULT_RESOLUTION[1] - 100 - MARGIN,
         "width": 300,
         "height": 50,
+    },
+    "Jauge Vitesse Linéaire": {
+        "visible": False,
+        "x": MARGIN,
+        "y": DEFAULT_RESOLUTION[1] - 40 - MARGIN,
+        "width": 300,
+        "height": 30,
+    },
+    "Jauge Vitesse Compteur": {
+        "visible": False,
+        "x": MARGIN,
+        "y": DEFAULT_RESOLUTION[1] - 160 - MARGIN,
+        "width": 200,
+        "height": 80,
     },
     # Augmente la hauteur pour accueillir Allure, FC et Pente
     "Infos Texte": {
@@ -445,6 +460,29 @@ def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
     draw.text((cx - text_w/2, y0 + (h - text_h)/2 - 10), speed_text, font=font, fill=text_color)
 
+def draw_linear_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
+    x, y = draw_area["x"], draw_area["y"]
+    w, h = draw_area["width"], draw_area["height"]
+    draw.rectangle([x, y, x + w, y + h], outline=gauge_bg_color, width=2)
+    fraction = 0.0 if speed_max <= speed_min else (speed - speed_min) / (speed_max - speed_min)
+    fraction = max(0.0, min(1.0, fraction))
+    col = (0, 255, 0) if fraction < 0.33 else ((255, 255, 0) if fraction < 0.66 else (255, 0, 0))
+    fill_w = int(w * fraction)
+    draw.rectangle([x, y, x + fill_w, y + h], fill=col)
+    speed_text = f"{speed:.0f} km/h"
+    text_bbox = draw.textbbox((0, 0), speed_text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
+    draw.text((x + w/2 - text_w/2, y + h/2 - text_h/2), speed_text, font=font, fill=text_color)
+
+def draw_digital_speedometer(draw, speed, draw_area, font, gauge_bg_color, text_color):
+    x, y = draw_area["x"], draw_area["y"]
+    w, h = draw_area["width"], draw_area["height"]
+    draw.rectangle([x, y, x + w, y + h], fill=gauge_bg_color)
+    speed_text = f"{speed:.0f}"
+    text_bbox = draw.textbbox((0, 0), speed_text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
+    draw.text((x + w/2 - text_w/2, y + h/2 - text_h/2), speed_text, font=font, fill=text_color)
+
 def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
     display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
     draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
@@ -609,7 +647,9 @@ def generate_gpx_video(
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
     hr_area    = element_configs.get("Profil Cardio", {})
-    gauge_area = element_configs.get("Jauge Vitesse", {})
+    gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
+    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
+    gauge_cnt_area  = element_configs.get("Jauge Vitesse Compteur", {})
     info_area  = element_configs.get("Infos Texte", {})
 
     mw = int(map_area.get("width", 0))
@@ -778,13 +818,33 @@ def generate_gpx_video(
                         text_c,
                     )
 
-                if gauge_area.get("visible", False):
+                if gauge_circ_area.get("visible", False):
                     draw_circular_speedometer(
                         draw,
                         float(interp_speeds[frame_idx]),
                         speed_min,
                         speed_max,
-                        gauge_area,
+                        gauge_circ_area,
+                        font_medium,
+                        gauge_bg_c,
+                        text_c,
+                    )
+                if gauge_lin_area.get("visible", False):
+                    draw_linear_speedometer(
+                        draw,
+                        float(interp_speeds[frame_idx]),
+                        speed_min,
+                        speed_max,
+                        gauge_lin_area,
+                        font_medium,
+                        gauge_bg_c,
+                        text_c,
+                    )
+                if gauge_cnt_area.get("visible", False):
+                    draw_digital_speedometer(
+                        draw,
+                        float(interp_speeds[frame_idx]),
+                        gauge_cnt_area,
                         font_medium,
                         gauge_bg_c,
                         text_c,
@@ -992,13 +1052,33 @@ def generate_gpx_video(
                         text_c,
                     )
 
-                if gauge_area.get("visible", False):
+                if gauge_circ_area.get("visible", False):
                     draw_circular_speedometer(
                         draw,
                         float(interp_speeds[frame_idx]),
                         speed_min,
                         speed_max,
-                        gauge_area,
+                        gauge_circ_area,
+                        font_medium,
+                        gauge_bg_c,
+                        text_c,
+                    )
+                if gauge_lin_area.get("visible", False):
+                    draw_linear_speedometer(
+                        draw,
+                        float(interp_speeds[frame_idx]),
+                        speed_min,
+                        speed_max,
+                        gauge_lin_area,
+                        font_medium,
+                        gauge_bg_c,
+                        text_c,
+                    )
+                if gauge_cnt_area.get("visible", False):
+                    draw_digital_speedometer(
+                        draw,
+                        float(interp_speeds[frame_idx]),
+                        gauge_cnt_area,
                         font_medium,
                         gauge_bg_c,
                         text_c,
@@ -1106,7 +1186,9 @@ def render_first_frame_image(
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
     hr_area    = element_configs.get("Profil Cardio", {})
-    gauge_area = element_configs.get("Jauge Vitesse", {})
+    gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
+    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
+    gauge_cnt_area  = element_configs.get("Jauge Vitesse Compteur", {})
     info_area  = element_configs.get("Infos Texte", {})
 
     mw = int(map_area.get("width", 0)); mh = int(map_area.get("height", 0))
@@ -1358,13 +1440,33 @@ def render_first_frame_image(
             text_c,
         )
 
-    if gauge_area.get("visible", False):
+    if gauge_circ_area.get("visible", False):
         draw_circular_speedometer(
             draw,
             float(interp_speeds[0]),
             speed_min,
             speed_max,
-            gauge_area,
+            gauge_circ_area,
+            font_medium,
+            gauge_bg_c,
+            text_c,
+        )
+    if gauge_lin_area.get("visible", False):
+        draw_linear_speedometer(
+            draw,
+            float(interp_speeds[0]),
+            speed_min,
+            speed_max,
+            gauge_lin_area,
+            font_medium,
+            gauge_bg_c,
+            text_c,
+        )
+    if gauge_cnt_area.get("visible", False):
+        draw_digital_speedometer(
+            draw,
+            float(interp_speeds[0]),
+            gauge_cnt_area,
             font_medium,
             gauge_bg_c,
             text_c,
@@ -1426,6 +1528,10 @@ class GPXVideoApp:
             "gauge_background": GAUGE_BG_COLOR,
         }
         self._initialize_color_configs()
+
+        # Police d'écriture
+        self.font_path_var = tk.StringVar(value=DEFAULT_FONT_PATH)
+        self.font_size_var = tk.IntVar(value=FONT_SIZE_LARGE)
 
         # Validation entrées
         self.vcmd_int = (master.register(self.validate_integer_or_empty), "%P")
@@ -1578,6 +1684,15 @@ class GPXVideoApp:
         self.resolution_entry.pack(fill=tk.X, pady=2)
         self.resolution_entry.bind("<FocusOut>", self.on_resolution_change)
         self.resolution_entry.bind("<Return>", self.on_resolution_change)
+
+        ttk.Label(gen_params_frame, text="Police (TTF):").pack(fill=tk.X, pady=2)
+        font_frame = ttk.Frame(gen_params_frame)
+        font_frame.pack(fill=tk.X, pady=2)
+        ttk.Entry(font_frame, textvariable=self.font_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        ttk.Button(font_frame, text="Parcourir", command=self.select_font_file).pack(side=tk.LEFT, padx=2)
+
+        ttk.Label(gen_params_frame, text="Taille police:").pack(fill=tk.X, pady=2)
+        ttk.Entry(gen_params_frame, textvariable=self.font_size_var, validate="key", validatecommand=self.vcmd_int).pack(fill=tk.X, pady=2)
 
         # Style de carte
         ttk.Label(gen_params_frame, text="Style de carte:").pack(fill=tk.X, pady=2)
@@ -1812,7 +1927,12 @@ class GPXVideoApp:
                 "width": int(self.element_pos_entries_vars.get(name, {}).get("width", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["width"])).get()),
                 "height": h,
             }
-        preview_img = generate_preview_image(tuple(self.current_video_resolution), DEFAULT_FONT_PATH, element_configs, self.color_configs)
+        preview_img = generate_preview_image(
+            tuple(self.current_video_resolution),
+            self.font_path_var.get() or DEFAULT_FONT_PATH,
+            element_configs,
+            self.color_configs,
+        )
         try:
             target_w = max(1, self.preview_area_width); target_h = max(1, self.preview_area_height)
             if preview_img.width > target_w or preview_img.height > target_h:
@@ -1847,6 +1967,11 @@ class GPXVideoApp:
                 "height": h,
             }
         res = tuple(self.current_video_resolution)
+        font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
+        font_size = max(10, int(self.font_size_var.get()))
+        global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
+        FONT_SIZE_LARGE = font_size
+        FONT_SIZE_MEDIUM = int(font_size * 0.75)
 
         try:
             img = render_first_frame_image(
@@ -1855,7 +1980,7 @@ class GPXVideoApp:
                 clip_duration=duration,
                 fps=fps,
                 resolution=res,
-                font_path=DEFAULT_FONT_PATH,
+                font_path=font_path,
                 element_configs=element_configs,
                 color_configs=self.color_configs,
                 map_style=self.map_style_var.get(),
@@ -1879,6 +2004,13 @@ class GPXVideoApp:
         self.preview_image_tk = photo
         self.preview_label.configure(image=photo)
         self.preview_label.image = photo
+
+    def select_font_file(self):
+        filetypes = [("Fichiers de police", "*.ttf *.otf"), ("Tous les fichiers", "*.*")]
+        filename = filedialog.askopenfilename(title="Choisir une police", filetypes=filetypes)
+        if filename:
+            self.font_path_var.set(filename)
+
     def select_gpx_file(self):
         filetypes = [("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")]
         filename = filedialog.askopenfilename(title="Choisir un fichier GPX", filetypes=filetypes)
@@ -1956,6 +2088,12 @@ class GPXVideoApp:
                         self.progress_time_var.set(format_hms(int(remaining)))
                 self.master.after(0, updater)
 
+            font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
+            font_size = max(10, int(self.font_size_var.get()))
+            global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
+            FONT_SIZE_LARGE = font_size
+            FONT_SIZE_MEDIUM = int(font_size * 0.75)
+
             success = generate_gpx_video(
                 self.gpx_file_path,
                 output_file,
@@ -1963,7 +2101,7 @@ class GPXVideoApp:
                 duration,
                 fps,
                 resolution,
-                DEFAULT_FONT_PATH,
+                font_path,
                 element_configs,
                 self.color_configs,
                 map_style=self.map_style_var.get(),
