@@ -33,24 +33,3 @@ Personnalisation complète des couleurs
 Disposition libre de chaque élément
 
 📸 Aperçu instantané de la première image avant rendu complet
-
-## Utilisation
-
-### Interface graphique
-
-Lancez l'interface Tkinter pour choisir un fichier GPX, définir l'extrait voulu
-et générer la vidéo directement :
-
-```bash
-python gui.py
-```
-
-### Ligne de commande
-
-Vous pouvez également appeler le script directement :
-
-```bash
-python main.py trace.gpx sortie.mp4 --duration 60 --fps 30
-```
-
-`--duration` et `--fps` sont optionnels.
