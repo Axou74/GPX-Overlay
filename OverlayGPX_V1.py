@@ -36,6 +36,8 @@ MAP_TILE_SERVERS = {
     "OpenSnowMap": [
         "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
         "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/contours/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/hillshading/{z}/{x}/{y}.png",
     ],
 }
 
@@ -383,7 +385,7 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
                 status, content = super().get(url, **kwargs)
             except Exception:
                 status, content = 0, None
-            if status == 404 and "tile-cyclosm.openstreetmap.fr" in url:
+            if status != 200 and "tile-cyclosm.openstreetmap.fr" in url:
                 for sub in "abc":
                     alt = url.replace("//a.tile-cyclosm", f"//{sub}.tile-cyclosm")
                     try:
@@ -392,7 +394,7 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
                         status, content = 0, None
                     if status == 200:
                         break
-                if status == 404 or status == 0:
+                if status != 200:
                     alt = url.replace(
                         "a.tile-cyclosm.openstreetmap.fr/cyclosm",
                         "tile.openstreetmap.org",
@@ -434,12 +436,12 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
     center = (lon_c, _clamp_lat(lat_c))
 
     if isinstance(template, (list, tuple)):
-        base_url, overlay_url = template
-        base_s = make_static_map(width, height, base_url, max_zoom=max_zoom)
-        overlay_s = make_static_map(width, height, overlay_url, max_zoom=max_zoom)
+        base_s = make_static_map(width, height, template[0], max_zoom=max_zoom)
         base_img = base_s.render(zoom=zoom, center=center).convert("RGBA")
-        overlay_img = overlay_s.render(zoom=zoom, center=center).convert("RGBA")
-        base_img.paste(overlay_img, (0, 0), overlay_img)
+        for overlay_url in template[1:]:
+            overlay_s = make_static_map(width, height, overlay_url, max_zoom=max_zoom)
+            overlay_img = overlay_s.render(zoom=zoom, center=center).convert("RGBA")
+            base_img.paste(overlay_img, (0, 0), overlay_img)
         return base_img.convert("RGB")
     else:
         s = make_static_map(width, height, template, max_zoom=max_zoom)

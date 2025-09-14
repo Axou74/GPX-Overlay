@@ -353,7 +353,7 @@ def make_static_map(width: int, height: int, url_template: str):
                 status, content = super().get(url, **kwargs)
             except Exception:
                 status, content = 0, None
-            if status == 404 and "tile-cyclosm.openstreetmap.fr" in url:
+            if status != 200 and "tile-cyclosm.openstreetmap.fr" in url:
                 for sub in "abc":
                     alt = url.replace("//a.tile-cyclosm", f"//{sub}.tile-cyclosm")
                     try:
@@ -362,7 +362,7 @@ def make_static_map(width: int, height: int, url_template: str):
                         status, content = 0, None
                     if status == 200:
                         break
-                if status == 404 or status == 0:
+                if status != 200:
                     alt = url.replace(
                         "a.tile-cyclosm.openstreetmap.fr/cyclosm",
                         "tile.openstreetmap.org",

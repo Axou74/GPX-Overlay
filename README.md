@@ -5,7 +5,7 @@ OverlayGPX est une application Python qui transforme un fichier GPX en une vidé
 
   ✨ Fonctionnalités
 
-🗺️ Carte de fond avec trace GPS animée (OpenStreetMap, CyclOSM, IGN Satellite…)
+🗺️ Carte de fond avec trace GPS animée (OpenStreetMap, CyclOSM, IGN Satellite, OpenSnowMap avec pistes, courbes de niveau et relief…)
 ⛰️ Profil d’altitude
 
 🚴 Profil de vitesse
