@@ -25,12 +25,17 @@ OverlayGPX est une application Python qui transforme un fichier GPX en une vidé
 
 🖥️ Interface graphique Tkinter intuitive :
 
-Choix de la résolution et des FPS
+-Choix de la résolution et des FPS
 
-Choix du style de carte et niveau de zoom (1 à 12)
+-Choix du style de carte et niveau de zoom (1 à 12)
 
-Personnalisation complète des couleurs
+-Personnalisation complète des couleurs
 
-Disposition libre de chaque élément
+-Disposition libre de chaque élément
 
 📸 Aperçu instantané de la première image avant rendu complet
+
+<img width="1801" height="830" alt="Interface vide" src="https://github.com/user-attachments/assets/07081205-9dca-451a-8258-0397473373e6" />
+
+<img width="1801" height="831" alt="Interface couleur" src="https://github.com/user-attachments/assets/23a91b1c-3b17-4331-846b-2479db3159fd" />
+<img width="1802" height="830" alt="Interface disposition" src="https://github.com/user-attachments/assets/9d868c59-a3f5-43ef-9fa5-bc975c0472cf" />
