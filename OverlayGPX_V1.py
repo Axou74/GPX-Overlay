@@ -38,7 +38,14 @@ MAP_TILE_SERVERS = {
 # --- Réglages géométrie et apparence ---
 DEFAULT_RESOLUTION = (1920, 1080)
 DEFAULT_FPS = 25
-DEFAULT_FONT_PATH = "arial.ttf"
+# Police d'écriture
+FONT_CHOICES = {
+    "DejaVu Sans": "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "DejaVu Serif": "/usr/share/fonts/truetype/dejavu/DejaVuSerif.ttf",
+    "Arial": "arial.ttf",
+}
+DEFAULT_FONT_NAME = "DejaVu Sans"
+DEFAULT_FONT_PATH = FONT_CHOICES[DEFAULT_FONT_NAME]
 DEFAULT_CLIP_DURATION_SECONDS = 5
 
 # Couleurs par défaut
@@ -53,6 +60,7 @@ FONT_SIZE_LARGE = 40
 FONT_SIZE_MEDIUM = 30
 MARGIN = 50
 GRAPH_PADDING = 100
+SPEEDOMETER_STYLES = ["circulaire", "digital"]
 
 DEFAULT_ELEMENT_CONFIGS = {
     "Carte": {
@@ -97,6 +105,7 @@ DEFAULT_ELEMENT_CONFIGS = {
         "y": DEFAULT_RESOLUTION[1] - 100 - MARGIN,
         "width": 300,
         "height": 50,
+        "style": "circulaire",
     },
     # Augmente la hauteur pour accueillir Allure, FC et Pente
     "Infos Texte": {
@@ -445,6 +454,15 @@ def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
     draw.text((cx - text_w/2, y0 + (h - text_h)/2 - 10), speed_text, font=font, fill=text_color)
 
+def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
+    x0, y0 = draw_area["x"], draw_area["y"]
+    w, h = draw_area["width"], draw_area["height"]
+    draw.rectangle([x0, y0, x0 + w, y0 + h], fill=gauge_bg_color)
+    speed_text = f"{speed:.0f} km/h"
+    text_bbox = draw.textbbox((0, 0), speed_text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
+    draw.text((x0 + (w - text_w) / 2, y0 + (h - text_h) / 2), speed_text, font=font, fill=text_color)
+
 def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
     display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
     draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
@@ -779,7 +797,9 @@ def generate_gpx_video(
                     )
 
                 if gauge_area.get("visible", False):
-                    draw_circular_speedometer(
+                    style = gauge_area.get("style", "circulaire")
+                    func = draw_digital_speedometer if style == "digital" else draw_circular_speedometer
+                    func(
                         draw,
                         float(interp_speeds[frame_idx]),
                         speed_min,
@@ -993,7 +1013,9 @@ def generate_gpx_video(
                     )
 
                 if gauge_area.get("visible", False):
-                    draw_circular_speedometer(
+                    style = gauge_area.get("style", "circulaire")
+                    func = draw_digital_speedometer if style == "digital" else draw_circular_speedometer
+                    func(
                         draw,
                         float(interp_speeds[frame_idx]),
                         speed_min,
@@ -1359,7 +1381,9 @@ def render_first_frame_image(
         )
 
     if gauge_area.get("visible", False):
-        draw_circular_speedometer(
+        style = gauge_area.get("style", "circulaire")
+        func = draw_digital_speedometer if style == "digital" else draw_circular_speedometer
+        func(
             draw,
             float(interp_speeds[0]),
             speed_min,
@@ -1404,6 +1428,7 @@ class GPXVideoApp:
         self.element_sliders = {}
         self.element_calculated_height_labels = {}
         self.element_initial_ratios = {}
+        self.element_style_vars = {}
 
         self.preview_image_tk = None
         self.current_video_resolution = list(DEFAULT_RESOLUTION)
@@ -1434,6 +1459,7 @@ class GPXVideoApp:
         # Style de carte + Zoom (1..12)
         self.map_style_var = tk.StringVar(value="CyclOSM (FR)")
         self.map_zoom_level_var = tk.IntVar(value=8)  # 1..12
+        self.font_var = tk.StringVar(value=DEFAULT_FONT_NAME)
 
         # Labels conviviaux
         self.color_labels = {
@@ -1579,6 +1605,11 @@ class GPXVideoApp:
         self.resolution_entry.bind("<FocusOut>", self.on_resolution_change)
         self.resolution_entry.bind("<Return>", self.on_resolution_change)
 
+        ttk.Label(gen_params_frame, text="Police :").pack(fill=tk.X, pady=2)
+        self.font_combo = ttk.Combobox(gen_params_frame, textvariable=self.font_var, values=list(FONT_CHOICES.keys()), state="readonly")
+        self.font_combo.pack(fill=tk.X, pady=2)
+        self.font_combo.bind("<<ComboboxSelected>>", lambda e: self.show_preview(force_update=True))
+
         # Style de carte
         ttk.Label(gen_params_frame, text="Style de carte:").pack(fill=tk.X, pady=2)
         style_choices = list(MAP_TILE_SERVERS.keys())
@@ -1605,9 +1636,9 @@ class GPXVideoApp:
         elements_outer_frame.pack(fill=tk.X, pady=10, anchor="n", padx=5)
         scrollable_frame_elements = ttk.Frame(elements_outer_frame); scrollable_frame_elements.pack(fill=tk.X, expand=False)
 
-        headers = ["Élément", "Aff.", "X", "Y", "Largeur"]
+        headers = ["Élément", "Aff.", "X", "Y", "Largeur", "Style"]
         for i, _ in enumerate(headers):
-            scrollable_frame_elements.columnconfigure(i, weight=1 if i in [0, 2, 3, 4] else 0, minsize=50 if i != 0 else 80)
+            scrollable_frame_elements.columnconfigure(i, weight=1 if i in [0, 2, 3, 4, 5] else 0, minsize=50 if i != 0 else 80)
         for col, header_text in enumerate(headers):
             ttk.Label(scrollable_frame_elements, text=header_text).grid(row=0, column=col, padx=2, pady=2, sticky="w" if col == 0 else "nsew")
 
@@ -1623,6 +1654,7 @@ class GPXVideoApp:
             self.element_sliders_vars[element_name] = {}
             self.element_sliders[element_name] = {}
             self.element_calculated_height_labels[element_name] = tk.StringVar()
+            self.element_style_vars[element_name] = tk.StringVar(value=defaults.get("style", ""))
 
             for key_idx, key in enumerate(["x", "y", "width"]):
                 current_col = key_idx + 2
@@ -1644,6 +1676,13 @@ class GPXVideoApp:
                 slider.grid(row=0, column=0, sticky="ew", padx=(0, 2))
                 self.element_sliders[element_name][key] = slider
 
+            style_col = 5
+            if "style" in defaults:
+                style_combo = ttk.Combobox(scrollable_frame_elements, textvariable=self.element_style_vars[element_name], values=SPEEDOMETER_STYLES, state="readonly")
+                style_combo.grid(row=row_num, column=style_col, padx=2, pady=2)
+                style_combo.bind("<<ComboboxSelected>>", lambda e, el=element_name: self.handle_style_change(el))
+            else:
+                ttk.Label(scrollable_frame_elements, text="-").grid(row=row_num, column=style_col, padx=2, pady=2)
             row_num += 1
         # Onglet Couleurs
         colors_tab = ttk.Frame(config_panel_outer)
@@ -1724,6 +1763,9 @@ class GPXVideoApp:
                 self.element_calculated_height_labels[element_name].set(str(h_val))
             except Exception:
                 pass
+        self.show_preview(force_update=True)
+
+    def handle_style_change(self, element_name):
         self.show_preview(force_update=True)
 
     def update_all_slider_ranges(self):
@@ -1811,8 +1853,10 @@ class GPXVideoApp:
                 "y": int(self.element_pos_entries_vars.get(name, {}).get("y", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["y"])).get()),
                 "width": int(self.element_pos_entries_vars.get(name, {}).get("width", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["width"])).get()),
                 "height": h,
+                "style": self.element_style_vars.get(name, tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name].get("style", ""))).get(),
             }
-        preview_img = generate_preview_image(tuple(self.current_video_resolution), DEFAULT_FONT_PATH, element_configs, self.color_configs)
+        font_path = FONT_CHOICES.get(self.font_var.get(), DEFAULT_FONT_PATH)
+        preview_img = generate_preview_image(tuple(self.current_video_resolution), font_path, element_configs, self.color_configs)
         try:
             target_w = max(1, self.preview_area_width); target_h = max(1, self.preview_area_height)
             if preview_img.width > target_w or preview_img.height > target_h:
@@ -1845,9 +1889,10 @@ class GPXVideoApp:
                 "y": int(self.element_pos_entries_vars.get(name, {}).get("y", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["y"])).get()),
                 "width": int(self.element_pos_entries_vars.get(name, {}).get("width", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["width"])).get()),
                 "height": h,
+                "style": self.element_style_vars.get(name, tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name].get("style", ""))).get(),
             }
         res = tuple(self.current_video_resolution)
-
+        font_path = FONT_CHOICES.get(self.font_var.get(), DEFAULT_FONT_PATH)
         try:
             img = render_first_frame_image(
                 gpx_filename=self.gpx_file_path,
@@ -1855,7 +1900,7 @@ class GPXVideoApp:
                 clip_duration=duration,
                 fps=fps,
                 resolution=res,
-                font_path=DEFAULT_FONT_PATH,
+                font_path=font_path,
                 element_configs=element_configs,
                 color_configs=self.color_configs,
                 map_style=self.map_style_var.get(),
@@ -1927,6 +1972,7 @@ class GPXVideoApp:
                 "y": int(self.element_pos_entries_vars[name]["y"].get()),
                 "width": int(self.element_pos_entries_vars[name]["width"].get()),
                 "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else DEFAULT_ELEMENT_CONFIGS[name]["height"],
+                "style": self.element_style_vars.get(name, tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name].get("style", ""))).get(),
             }
 
         resolution = tuple(self.current_video_resolution)
@@ -1956,6 +2002,7 @@ class GPXVideoApp:
                         self.progress_time_var.set(format_hms(int(remaining)))
                 self.master.after(0, updater)
 
+            font_path = FONT_CHOICES.get(self.font_var.get(), DEFAULT_FONT_PATH)
             success = generate_gpx_video(
                 self.gpx_file_path,
                 output_file,
@@ -1963,7 +2010,7 @@ class GPXVideoApp:
                 duration,
                 fps,
                 resolution,
-                DEFAULT_FONT_PATH,
+                font_path,
                 element_configs,
                 self.color_configs,
                 map_style=self.map_style_var.get(),

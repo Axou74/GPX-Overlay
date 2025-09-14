@@ -32,4 +32,9 @@ Personnalisation complète des couleurs
 
 Disposition libre de chaque élément
 
+Choix de la police d’écriture
+
+Styles de compteur de vitesse (circulaire ou numérique)
+
 📸 Aperçu instantané de la première image avant rendu complet
+
