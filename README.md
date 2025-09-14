@@ -28,6 +28,8 @@ Choix de la résolution et des FPS
 
 Choix du style de carte et niveau de zoom (1 à 12)
 
+Limitation automatique du zoom au niveau maximum supporté par chaque fournisseur de tuiles
+
 Personnalisation complète des couleurs
 
 Disposition libre de chaque élément

@@ -36,6 +36,14 @@ MAP_TILE_SERVERS = {
     "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
 }
 
+# Zoom maximal supporté par chaque fournisseur de tuiles
+MAX_ZOOM = {
+    "OpenStreetMap": 19,
+    "IGN Satellite": 19,
+    "CyclOSM (FR)": 19,
+    "OpenSnowMap": 18,
+}
+
 # --- Réglages géométrie et apparence ---
 DEFAULT_RESOLUTION = (1920, 1080)
 DEFAULT_FPS = 25
@@ -358,11 +366,15 @@ def zoom_level_ui_to_offset(level_ui: int) -> int:
     level_ui = max(1, min(12, int(level_ui)))
     return level_ui - 8
 
-def make_static_map(width: int, height: int, url_template: str):
-    """Return a StaticMap instance with retry logic for CyclOSM tiles."""
+def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 19):
+    """Return a StaticMap instance with retry logic and zoom clamping."""
     from staticmap import StaticMap  # type: ignore
 
     class RetryingStaticMap(StaticMap):
+        def __init__(self, *args, **kwargs):
+            self.max_zoom = kwargs.pop("max_zoom", 19)
+            super().__init__(*args, **kwargs)
+
         def get(self, url, **kwargs):
             try:
                 status, content = super().get(url, **kwargs)
@@ -388,7 +400,24 @@ def make_static_map(width: int, height: int, url_template: str):
                         status, content = 0, None
             return status, content
 
-    return RetryingStaticMap(width, height, url_template=url_template, padding_x=0, padding_y=0, delay_between_retries=1)
+        def render(self, zoom, center=None):
+            zoom = min(zoom, self.max_zoom)
+            while zoom >= 0:
+                try:
+                    return super().render(zoom=zoom, center=center)
+                except Exception:
+                    zoom -= 1
+            raise RuntimeError("Failed to fetch tiles at any zoom level")
+
+    return RetryingStaticMap(
+        width,
+        height,
+        url_template=url_template,
+        padding_x=0,
+        padding_y=0,
+        delay_between_retries=1,
+        max_zoom=max_zoom,
+    )
 
 # ---------- Graph helpers ----------
 
@@ -715,7 +744,13 @@ def generate_gpx_video(
                 if map_style == "Aucun" or not STATICMAP_AVAILABLE:
                     base_map = Image.new("RGB", (mw, mh), bg_c)
                 else:
-                    s = make_static_map(mw, mh, MAP_TILE_SERVERS.get(map_style) or "https://tile.openstreetmap.org/{z}/{x}/{y}.png")
+                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
+                    s = make_static_map(
+                        mw,
+                        mh,
+                        template,
+                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
+                    )
                     base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
             except Exception as e:
                 print(f"Fond carte non dispo, fond uni utilisé (fixe): {e}")
@@ -898,9 +933,12 @@ def generate_gpx_video(
                 if map_style == "Aucun" or not STATICMAP_AVAILABLE:
                     base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
                 else:
+                    template = MAP_TILE_SERVERS.get(map_style, MAP_TILE_SERVERS["OpenStreetMap"])
                     s = make_static_map(
-                        width_large, height_large,
-                        MAP_TILE_SERVERS.get(map_style, MAP_TILE_SERVERS["OpenStreetMap"])
+                        width_large,
+                        height_large,
+                        template,
+                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
                     )
                     base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
             except Exception as e:
@@ -1245,7 +1283,13 @@ def render_first_frame_image(
                 if map_style == "Aucun" or not STATICMAP_AVAILABLE:
                     base_map = Image.new("RGB", (mw, mh), bg_c)
                 else:
-                    s = make_static_map(mw, mh, MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"])
+                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
+                    s = make_static_map(
+                        mw,
+                        mh,
+                        template,
+                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
+                    )
                     base_map = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
             except Exception:
                 base_map = Image.new("RGB", (mw, mh), bg_c)
@@ -1298,10 +1342,12 @@ def render_first_frame_image(
                 if map_style == "Aucun" or not STATICMAP_AVAILABLE:
                     base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
                 else:
+                    template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
                     s = make_static_map(
                         width_large,
                         height_large,
-                        MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
+                        template,
+                        max_zoom=MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"]),
                     )
                     base_map_img_large = s.render(zoom=zoom, center=(lon_c, _clamp_lat(lat_c))).convert("RGB")
             except Exception:
