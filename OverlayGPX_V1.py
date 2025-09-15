@@ -9,10 +9,6 @@ import sys, time
 import threading
 import imageio.v2 as imageio
 
-import threading
-
-import imageio.v2 as imageio
-
 import gpxpy
 import numpy as np
 import pytz
@@ -71,79 +67,91 @@ FONT_SIZE_MEDIUM = 30
 MARGIN = 50
 GRAPH_PADDING = 100
 
+LEFT_COLUMN_WIDTH = DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2
+RIGHT_COLUMN_X = DEFAULT_RESOLUTION[0] // 2 + MARGIN
+RIGHT_COLUMN_WIDTH = DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2
+MAP_HEIGHT_DEFAULT = 460
+MAP_BOTTOM = MARGIN + MAP_HEIGHT_DEFAULT
+COMPASS_HEIGHT = 70
+COMPASS_Y = MAP_BOTTOM + 30
+INFO_LINES_COUNT = 6
+INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
+INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
+INFO_TEXT_Y = COMPASS_Y + COMPASS_HEIGHT + 30
+GAUGE_BASE_Y = INFO_TEXT_Y + INFO_TEXT_HEIGHT + 20
+
 DEFAULT_ELEMENT_CONFIGS = {
     "Carte": {
         "visible": True,
         "x": MARGIN,
         "y": MARGIN,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
-        "height": DEFAULT_RESOLUTION[1] // 2 - MARGIN * 2,
+        "width": LEFT_COLUMN_WIDTH,
+        "height": MAP_HEIGHT_DEFAULT,
     },
     "Profil Altitude": {
         "visible": True,
-        "x": DEFAULT_RESOLUTION[0] // 2 + MARGIN,
+        "x": RIGHT_COLUMN_X,
         "y": MARGIN,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
+        "width": RIGHT_COLUMN_WIDTH,
         "height": 200,
     },
     "Profil Vitesse": {
         "visible": True,
-        "x": DEFAULT_RESOLUTION[0] // 2 + MARGIN,
+        "x": RIGHT_COLUMN_X,
         "y": MARGIN + 200 + GRAPH_PADDING,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
+        "width": RIGHT_COLUMN_WIDTH,
         "height": 150,
     },
     # --- AJOUTS : profils Allure & Cardio ---
     "Profil Allure": {
         "visible": True,
-        "x": DEFAULT_RESOLUTION[0] // 2 + MARGIN,
+        "x": RIGHT_COLUMN_X,
         "y": MARGIN + 200 + GRAPH_PADDING + 150 + GRAPH_PADDING,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
+        "width": RIGHT_COLUMN_WIDTH,
         "height": 150,
     },
     "Profil Cardio": {
         "visible": True,
-        "x": DEFAULT_RESOLUTION[0] // 2 + MARGIN,
+        "x": RIGHT_COLUMN_X,
         "y": MARGIN + 200 + GRAPH_PADDING + 150 + GRAPH_PADDING + 150 + GRAPH_PADDING,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,
+        "width": RIGHT_COLUMN_WIDTH,
         "height": 150,
     },
     "Jauge Vitesse Circulaire": {
         "visible": True,
         "x": MARGIN,
-        "y": DEFAULT_RESOLUTION[1] - 100 - MARGIN,
+        "y": GAUGE_BASE_Y,
         "width": 300,
         "height": 50,
     },
     "Jauge Vitesse Linéaire": {
         "visible": False,
         "x": MARGIN,
-        "y": DEFAULT_RESOLUTION[1] - 40 - MARGIN,
+        "y": GAUGE_BASE_Y,
         "width": 300,
         "height": 30,
     },
     "Jauge Vitesse Compteur": {
         "visible": False,
         "x": MARGIN,
-        "y": DEFAULT_RESOLUTION[1] - 160 - MARGIN,
+        "y": GAUGE_BASE_Y,
         "width": 200,
         "height": 80,
     },
-        "Boussole (ruban)": {
+    "Boussole (ruban)": {
         "visible": True,
         "x": MARGIN,
-        "y": DEFAULT_RESOLUTION[1] // 2 + MARGIN,
-        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,  # aligné sous la carte
-        "height": 70,
+        "y": COMPASS_Y,
+        "width": LEFT_COLUMN_WIDTH,  # aligné sous la carte
+        "height": COMPASS_HEIGHT,
     },
-
     # Augmente la hauteur pour accueillir Allure, FC et Pente
     "Infos Texte": {
         "visible": True,
         "x": MARGIN,
-        "y": DEFAULT_RESOLUTION[1] - (6 * FONT_SIZE_LARGE + 50) - 50 - 2 * MARGIN,
+        "y": INFO_TEXT_Y,
         "width": 450,
-        "height": 6 * FONT_SIZE_LARGE + 50,  # 6 lignes : Vitesse, Altitude, Heure, Pente, Allure, FC
+        "height": INFO_TEXT_HEIGHT,  # 6 lignes : Vitesse, Altitude, Heure, Pente, Allure, FC
     },
 }
 
@@ -1507,7 +1515,6 @@ class GPXVideoApp:
             pass
 
         self.gpx_file_path = ""
-        self.output_filename = ""
         self.gpx_start_time_raw = None
         self.gpx_end_time_raw = None
         self.start_offset_var = tk.IntVar(value=0)
@@ -1567,8 +1574,7 @@ class GPXVideoApp:
             "text": "Texte",
             "gauge_background": "Fond jauge",
         }
-        self.progress_var = tk.IntVar(value=0)
-        self.progress_bar = None
+        self.progress_message_default = "Temps restant estimé : --:--:--"
         self.generate_btn = None
         self.create_widgets()
         self.populate_initial_element_ratios()
@@ -1640,11 +1646,8 @@ class GPXVideoApp:
         self.gpx_toolbar_label_var = tk.StringVar(value="GPX: aucun")
         ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var).pack(side=tk.LEFT, padx=6)
 
-        self.progress_time_var = tk.StringVar(value="")
+        self.progress_time_var = tk.StringVar(value=self.progress_message_default)
         ttk.Label(toolbar, textvariable=self.progress_time_var).pack(side=tk.RIGHT, padx=6)
-
-        self.progress_bar = ttk.Progressbar(toolbar, variable=self.progress_var, length=150, maximum=100)
-        self.progress_bar.pack(side=tk.RIGHT, padx=6, fill=tk.X, expand=True)
 
         # Colonne gauche avec onglets pour condenser l'interface
         config_panel_outer = ttk.Notebook(main_frame); self.config_panel_outer = config_panel_outer
@@ -2065,31 +2068,34 @@ class GPXVideoApp:
             }
 
         resolution = tuple(self.current_video_resolution)
-        output_file = filedialog.asksaveasfilename(
-            title="Enregistrer la vidéo sous...",
-            defaultextension=".mp4",
-            filetypes=[("Fichiers vidéo MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
-        )
-        if not output_file: return
+        output_dir = os.path.dirname(self.gpx_file_path) or os.getcwd()
+        base_name = os.path.splitext(os.path.basename(self.gpx_file_path))[0] or "video"
+        output_file = os.path.join(output_dir, f"{base_name}.mp4")
+        if os.path.exists(output_file):
+            overwrite = messagebox.askyesno(
+                "Fichier existant",
+                f"Le fichier \"{output_file}\" existe déjà. Voulez-vous l'écraser ?",
+            )
+            if not overwrite:
+                return
 
         self.generate_btn.config(state=tk.DISABLED)
-        self.progress_var.set(0)
-        self.progress_time_var.set("")
+        self.progress_time_var.set("Temps restant estimé : calcul en cours…")
         start_time = time.time()
 
         def run_generation():
             error_msg = None
-        
+
             def progress_cb(pct):
                 if pct > 0:
                     elapsed = time.time() - start_time
                     remaining = elapsed * (100 - pct) / pct
+                    label = f"Temps restant estimé : {format_hms(int(remaining))}"
                 else:
-                    remaining = 0
+                    label = "Temps restant estimé : calcul en cours…"
+
                 def updater():
-                    self.progress_var.set(pct)
-                    if pct > 0:
-                        self.progress_time_var.set(format_hms(int(remaining)))
+                    self.progress_time_var.set(label)
                 self.master.after(0, updater)
         
             try:
@@ -2116,13 +2122,16 @@ class GPXVideoApp:
             except Exception as e:
                 success = False
                 error_msg = str(e)
-        
+
             def finalize():
                 self.generate_btn.config(state=tk.NORMAL)
-                self.progress_var.set(0)
-                self.progress_time_var.set("")
+                self.progress_time_var.set(self.progress_message_default)
                 if success:
-                    messagebox.showinfo("Succès", "La vidéo a été générée avec succès!")
+                    messagebox.showinfo(
+                        "Succès",
+                        "La vidéo a été générée avec succès dans :\n"
+                        f"{output_file}",
+                    )
                 else:
                     if error_msg:
                         messagebox.showerror("Erreur", f"Échec génération : {error_msg}")
