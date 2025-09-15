@@ -777,7 +777,6 @@ def generate_gpx_video(
     color_configs=None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
-    fixed_map_view: bool = False, # <<< NOUVEAU
     progress_callback=None,
 ) -> bool:
     # --- Config interne ---
@@ -921,406 +920,239 @@ def generate_gpx_video(
 
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
 
-        # -------------- MODE 1 : CARTE FIXE (afficher tout le tracé) --------------
-        if fixed_map_view:
-            PAD_PX_FOR_FIT = 30
-            base_zoom = bbox_fit_zoom(mw, mh, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=PAD_PX_FOR_FIT)
-            # on autorise seulement de "dézoomer" (offset négatif) pour garder 100% du tracé visible
-            zoom_offset = zoom_level_ui - 8
-            if zoom_offset > 0:
-                zoom_offset = 0
-            zoom = max(1, min(19, base_zoom + zoom_offset))
+        # Calcul du zoom de base (sur grande image), avec offset UI
+        est_w = int(min(MAX_LARGE_DIM, mw * 6))
+        est_h = int(min(MAX_LARGE_DIM, mh * 6))
+        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
+        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-            # Rendu du fond : pile à la taille du viewport
-            try:
-                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True)
-            except Exception as e:
-                print(f"Fond carte non dispo, fond uni utilisé (fixe): {e}")
-                base_map = Image.new("RGB", (mw, mh), bg_c)
+        # Positions "monde" au zoom choisi
+        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
-            # Projeter la trace au même zoom, repère du viewport fixe
-            cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-            x0 = cx - mw / 2.0
-            y0 = cy - mh / 2.0
-            xs_pix, ys_pix = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-            xs = np.rint(xs_pix - x0).astype(int)
-            ys = np.rint(ys_pix - y0).astype(int)
-            path_xy_full = list(zip(xs.tolist(), ys.tolist()))
+        # Etendue, marge et image "large"
+        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
+        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        track_w = x_max - x_min; track_h = y_max - y_min
 
-            # Rendu images -> flux vidéo
-            for frame_idx in range(total_frames):
-                frame_img = Image.new("RGB", resolution, bg_c)
-                draw = ImageDraw.Draw(frame_img)
+        patch_w = int(math.ceil(mw * PATCH_FACTOR))
+        patch_h = int(math.ceil(mh * PATCH_FACTOR))
+        margin_x = patch_w // 2 + 64
+        margin_y = patch_h // 2 + 64
+        width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
 
-                # 1) Copie du fond fixe
-                map_layer = base_map.copy()
+        # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
+        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
+        x0_world = cx - width_large / 2.0
+        y0_world = cy - height_large / 2.0
 
-                # 2) Tracé complet + progression + point
-                mdraw = ImageDraw.Draw(map_layer)
-                mdraw.line(path_xy_full, fill=map_path_c, width=3)
-                mdraw.line(path_xy_full[: frame_idx + 1], fill=map_current_path_c, width=4)
-                cxp, cyp = path_xy_full[frame_idx]
-                r = 6
-                mdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
+        # Fond "large"
+        try:
+            base_map_img_large = render_base_map(
+                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
+            )
+        except Exception as e:
+            print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
+            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-                # 3) Collage dans l'image finale
-                frame_img.paste(map_layer, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
-                draw_north_arrow(frame_img, map_area, 0.0, text_c)
+        # Trace dans le repère "large"
+        x_full = xs_world - x0_world
+        y_full = ys_world - y0_world
 
-                draw_north_arrow(frame_img, map_area, 0.0, text_c)
+        # Tête lissée (pour rotation)
+        headings = []
+        for i in range(total_frames):
+            if i < total_frames - 1:
+                dx = x_full[i + 1] - x_full[i]; dy = y_full[i + 1] - y_full[i]
+            else:
+                dx = x_full[i] - x_full[i - 1]; dy = y_full[i] - y_full[i - 1]
+            headings.append(math.atan2(dx, -dy) if (abs(dx) > 1e-9 or abs(dy) > 1e-9) else 0.0)
+        complex_raw = np.exp(1j * np.array(headings))
+        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
+        smoothed_angles = []
+        for idx in range(total_frames):
+            w = int(win_sizes[idx])
+            half_w = w // 2
+            a = max(0, idx - half_w)
+            b = min(total_frames, idx + half_w + 1)
+            avg = np.mean(complex_raw[a:b])
+            smoothed_angles.append(math.atan2(avg.imag, avg.real))
 
+        # Rendu images -> flux vidéo
+        last_heading_deg = math.degrees(smoothed_angles[0])
 
-                # Profils & infos
-                if elev_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        elev_path,
-                        frame_idx,
-                        elev_min,
-                        elev_max,
-                        elev_area,
-                        font_medium,
-                        "Altitude",
-                        "m",
-                        alt_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                if speed_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        speed_path,
-                        frame_idx,
+        for frame_idx in range(total_frames):
+            frame_img = Image.new("RGB", resolution, bg_c)
+            draw = ImageDraw.Draw(frame_img)
 
-                        speed_min_val,
-                        speed_max_val,
+            # Patch centré sur le point courant
+            xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
+            patch_left = int(round(xc - patch_w / 2.0))
+            patch_top  = int(round(yc - patch_h / 2.0))
+            patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
 
-                        speed_area,
-                        font_medium,
-                        "Vitesse",
-                        "km/h",
-                        speed_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                # --- AJOUTS : Allure & Cardio ---
-                if pace_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        pace_path,
-                        frame_idx,
-                        pace_min,
-                        pace_max,
-                        pace_area,
-                        font_medium,
-                        "Allure",
-                        "min/km",
-                        pace_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                if hr_area.get("visible", False) and has_hr:
-                    draw_graph(
-                        draw,
-                        hr_path,
-                        frame_idx,
-                        hr_min,
-                        hr_max,
-                        hr_area,
-                        font_medium,
-                        "FC",
-                        "bpm",
-                        hr_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
+            src_left   = max(0, patch_left)
+            src_top    = max(0, patch_top)
+            src_right  = min(base_map_img_large.width,  patch_left + patch_w)
+            src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
+            if src_right > src_left and src_bottom > src_top:
+                crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+                dest_x = src_left - patch_left
+                dest_y = src_top  - patch_top
+                patch_img.paste(crop, (dest_x, dest_y))
 
-                if gauge_circ_area.get("visible", False):
-                    draw_circular_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        speed_min,
-                        speed_max,
-                        gauge_circ_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                if gauge_lin_area.get("visible", False):
-                    draw_linear_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        speed_min,
-                        speed_max,
-                        gauge_lin_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                                # Boussole : cap fixe (Nord en haut)
-                if compass_area.get("visible", False):
-                    draw_compass_tape(draw, 0.0, compass_area, font_medium, text_c)
+            # Trace + progression + point (dans le patch)
+            pdraw = ImageDraw.Draw(patch_img)
+            local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
+            pdraw.line(local_xy, fill=map_path_c, width=3)
+            pdraw.line(local_xy[: frame_idx + 1], fill=map_current_path_c, width=4)
+            cxp, cyp = local_xy[frame_idx]; r = 6
+            pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
 
-                if gauge_cnt_area.get("visible", False):
-                    draw_digital_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        gauge_cnt_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                if info_area.get("visible", False):
-                    draw_info_text(draw,
-                                   float(interp_speeds[frame_idx]),
-                                   float(interp_eles[frame_idx]),
-                                   float(interp_slopes[frame_idx]),
-                                   start_time + timedelta(seconds=float(interp_times[frame_idx])),
-                                   info_area, font_medium, tz, text_c)
-                    # --- Texte Allure & FC supplémentaires ---
-                    pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
-                    hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
-                    draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
+            # Rotation patch (cadre fixe)
+            speed_kmh = float(interp_speeds[frame_idx])
+            desired_heading = math.degrees(smoothed_angles[frame_idx])
+            if speed_kmh >= 4.0:
+                diff = ((desired_heading - last_heading_deg + 180) % 360) - 180
+                last_heading_deg += 0.1 * diff
+            heading_deg = last_heading_deg
+            patch_img = patch_img.rotate(
+                heading_deg,
+                resample=Image.BICUBIC,
+                expand=False,
+                center=(patch_w / 2.0, patch_h / 2.0),
+            )
 
-                writer.append_data(np.array(frame_img))
-                _progress(frame_idx + 1)
+            # Recadrage EXACT viewport
+            view_left = int(round(patch_w / 2.0 - mw / 2.0))
+            view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+
+            # Collage final
+            frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+            draw_north_arrow(frame_img, map_area, heading_deg, text_c)
+
+            draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
 
-        # -------------- MODE 2 : DYNAMIQUE (rotation/pan sur patch + recadrage) --------------
-        else:
-            # Calcul du zoom de base (sur grande image), avec offset UI
-            est_w = int(min(MAX_LARGE_DIM, mw * 6))
-            est_h = int(min(MAX_LARGE_DIM, mh * 6))
-            base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-            zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
-
-            # Positions "monde" au zoom choisi
-            xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-
-            # Etendue, marge et image "large"
-            x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-            y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-            track_w = x_max - x_min; track_h = y_max - y_min
-
-            patch_w = int(math.ceil(mw * PATCH_FACTOR))
-            patch_h = int(math.ceil(mh * PATCH_FACTOR))
-            margin_x = patch_w // 2 + 64
-            margin_y = patch_h // 2 + 64
-            width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-            height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
-
-            # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
-            cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-            x0_world = cx - width_large / 2.0
-            y0_world = cy - height_large / 2.0
-
-            # Fond "large"
-            try:
-                base_map_img_large = render_base_map(
-                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
+            # Profils & infos
+            if elev_area.get("visible", False):
+                draw_graph(
+                    draw,
+                    elev_path,
+                    frame_idx,
+                    elev_min,
+                    elev_max,
+                    elev_area,
+                    font_medium,
+                    "Altitude",
+                    "m",
+                    alt_path_c,
+                    graph_current_point_c,
+                    text_c,
                 )
-            except Exception as e:
-                print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
-                base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+            if speed_area.get("visible", False):
+                draw_graph(
+                    draw,
+                    speed_path,
+                    frame_idx,
 
-            # Trace dans le repère "large"
-            x_full = xs_world - x0_world
-            y_full = ys_world - y0_world
+                    speed_min_val,
+                    speed_max_val,
 
-            # Tête lissée (pour rotation)
-            headings = []
-            for i in range(total_frames):
-                if i < total_frames - 1:
-                    dx = x_full[i + 1] - x_full[i]; dy = y_full[i + 1] - y_full[i]
-                else:
-                    dx = x_full[i] - x_full[i - 1]; dy = y_full[i] - y_full[i - 1]
-                headings.append(math.atan2(dx, -dy) if (abs(dx) > 1e-9 or abs(dy) > 1e-9) else 0.0)
-            complex_raw = np.exp(1j * np.array(headings))
-            win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-            smoothed_angles = []
-            for idx in range(total_frames):
-                w = int(win_sizes[idx])
-                half_w = w // 2
-                a = max(0, idx - half_w)
-                b = min(total_frames, idx + half_w + 1)
-                avg = np.mean(complex_raw[a:b])
-                smoothed_angles.append(math.atan2(avg.imag, avg.real))
-
-            # Rendu images -> flux vidéo
-            last_heading_deg = math.degrees(smoothed_angles[0])
-
-            for frame_idx in range(total_frames):
-                frame_img = Image.new("RGB", resolution, bg_c)
-                draw = ImageDraw.Draw(frame_img)
-
-                # Patch centré sur le point courant
-                xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
-                patch_left = int(round(xc - patch_w / 2.0))
-                patch_top  = int(round(yc - patch_h / 2.0))
-                patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
-
-                src_left   = max(0, patch_left)
-                src_top    = max(0, patch_top)
-                src_right  = min(base_map_img_large.width,  patch_left + patch_w)
-                src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
-                if src_right > src_left and src_bottom > src_top:
-                    crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
-                    dest_x = src_left - patch_left
-                    dest_y = src_top  - patch_top
-                    patch_img.paste(crop, (dest_x, dest_y))
-
-                # Trace + progression + point (dans le patch)
-                pdraw = ImageDraw.Draw(patch_img)
-                local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
-                pdraw.line(local_xy, fill=map_path_c, width=3)
-                pdraw.line(local_xy[: frame_idx + 1], fill=map_current_path_c, width=4)
-                cxp, cyp = local_xy[frame_idx]; r = 6
-                pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
-
-                # Rotation patch (cadre fixe)
-                speed_kmh = float(interp_speeds[frame_idx])
-                desired_heading = math.degrees(smoothed_angles[frame_idx])
-                if speed_kmh >= 4.0:
-                    diff = ((desired_heading - last_heading_deg + 180) % 360) - 180
-                    last_heading_deg += 0.1 * diff
-                heading_deg = last_heading_deg
-                patch_img = patch_img.rotate(
-                    heading_deg,
-                    resample=Image.BICUBIC,
-                    expand=False,
-                    center=(patch_w / 2.0, patch_h / 2.0),
+                    speed_area,
+                    font_medium,
+                    "Vitesse",
+                    "km/h",
+                    speed_path_c,
+                    graph_current_point_c,
+                    text_c,
+                )
+            # --- AJOUTS : Allure & Cardio ---
+            if pace_area.get("visible", False):
+                draw_graph(
+                    draw,
+                    pace_path,
+                    frame_idx,
+                    pace_min,
+                    pace_max,
+                    pace_area,
+                    font_medium,
+                    "Allure",
+                    "min/km",
+                    pace_path_c,
+                    graph_current_point_c,
+                    text_c,
+                )
+            if hr_area.get("visible", False) and has_hr:
+                draw_graph(
+                    draw,
+                    hr_path,
+                    frame_idx,
+                    hr_min,
+                    hr_max,
+                    hr_area,
+                    font_medium,
+                    "FC",
+                    "bpm",
+                    hr_path_c,
+                    graph_current_point_c,
+                    text_c,
                 )
 
-                # Recadrage EXACT viewport
-                view_left = int(round(patch_w / 2.0 - mw / 2.0))
-                view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-                view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+            if gauge_circ_area.get("visible", False):
+                draw_circular_speedometer(
+                    draw,
+                    float(interp_speeds[frame_idx]),
+                    speed_min,
+                    speed_max,
+                    gauge_circ_area,
+                    font_medium,
+                    gauge_bg_c,
+                    text_c,
+                )
+            if gauge_lin_area.get("visible", False):
+                draw_linear_speedometer(
+                    draw,
+                    float(interp_speeds[frame_idx]),
+                    speed_min,
+                    speed_max,
+                    gauge_lin_area,
+                    font_medium,
+                    gauge_bg_c,
+                    text_c,
+                )
+            if gauge_cnt_area.get("visible", False):
+                draw_digital_speedometer(
+                    draw,
+                    float(interp_speeds[frame_idx]),
+                    gauge_cnt_area,
+                    font_medium,
+                    gauge_bg_c,
+                    text_c,
+                )
+            # Boussole : cap courant
+            if compass_area.get("visible", False):
+                draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
-                # Collage final
-                frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
-                draw_north_arrow(frame_img, map_area, heading_deg, text_c)
+            if info_area.get("visible", False):
+                draw_info_text(draw,
+                               float(interp_speeds[frame_idx]),
+                               float(interp_eles[frame_idx]),
+                               float(interp_slopes[frame_idx]),
+                               start_time + timedelta(seconds=float(interp_times[frame_idx])),
+                               info_area, font_medium, tz, text_c)
+                # --- Texte Allure & FC supplémentaires ---
+                pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
+                hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
+                draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
-                draw_north_arrow(frame_img, map_area, heading_deg, text_c)
-
-
-                # Profils & infos
-                if elev_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        elev_path,
-                        frame_idx,
-                        elev_min,
-                        elev_max,
-                        elev_area,
-                        font_medium,
-                        "Altitude",
-                        "m",
-                        alt_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                if speed_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        speed_path,
-                        frame_idx,
-
-                        speed_min_val,
-                        speed_max_val,
-
-                        speed_area,
-                        font_medium,
-                        "Vitesse",
-                        "km/h",
-                        speed_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                # --- AJOUTS : Allure & Cardio ---
-                if pace_area.get("visible", False):
-                    draw_graph(
-                        draw,
-                        pace_path,
-                        frame_idx,
-                        pace_min,
-                        pace_max,
-                        pace_area,
-                        font_medium,
-                        "Allure",
-                        "min/km",
-                        pace_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-                if hr_area.get("visible", False) and has_hr:
-                    draw_graph(
-                        draw,
-                        hr_path,
-                        frame_idx,
-                        hr_min,
-                        hr_max,
-                        hr_area,
-                        font_medium,
-                        "FC",
-                        "bpm",
-                        hr_path_c,
-                        graph_current_point_c,
-                        text_c,
-                    )
-
-                if gauge_circ_area.get("visible", False):
-                    draw_circular_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        speed_min,
-                        speed_max,
-                        gauge_circ_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                if gauge_lin_area.get("visible", False):
-                    draw_linear_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        speed_min,
-                        speed_max,
-                        gauge_lin_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                if gauge_cnt_area.get("visible", False):
-                    draw_digital_speedometer(
-                        draw,
-                        float(interp_speeds[frame_idx]),
-                        gauge_cnt_area,
-                        font_medium,
-                        gauge_bg_c,
-                        text_c,
-                    )
-                # Boussole : cap courant
-                if compass_area.get("visible", False):
-                    draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
-
-                if info_area.get("visible", False):
-                    draw_info_text(draw,
-                                   float(interp_speeds[frame_idx]),
-                                   float(interp_eles[frame_idx]),
-                                   float(interp_slopes[frame_idx]),
-                                   start_time + timedelta(seconds=float(interp_times[frame_idx])),
-                                   info_area, font_medium, tz, text_c)
-                    # --- Texte Allure & FC supplémentaires ---
-                    pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
-                    hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
-                    draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
-
-                writer.append_data(np.array(frame_img))
-                _progress(frame_idx + 1)
+            writer.append_data(np.array(frame_img))
+            _progress(frame_idx + 1)
 
 
         writer.close()
-        print(f"Vidéo ({'carte fixe' if fixed_map_view else 'dynamique'}) générée avec succès!")
+        print("Vidéo générée avec succès!")
         return True
 
     except Exception as e:
@@ -1347,7 +1179,6 @@ def render_first_frame_image(
     color_configs: dict | None = None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
-    fixed_map_view: bool = False,
 ):
     # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
@@ -1453,137 +1284,104 @@ def render_first_frame_image(
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
     frame_idx = 0
+    heading_deg = 0.0
 
     try:
-        if fixed_map_view:
-            PAD_PX_FOR_FIT = 30
-            base_zoom = bbox_fit_zoom(mw, mh, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=PAD_PX_FOR_FIT)
-            zoom_offset = zoom_level_ui - 8
-            if zoom_offset > 0:
-                zoom_offset = 0
-            zoom = max(1, min(19, base_zoom + zoom_offset))
+        est_w = int(min(MAX_LARGE_DIM, mw * 6))
+        est_h = int(min(MAX_LARGE_DIM, mh * 6))
+        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
+        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-            try:
-                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True)
-            except Exception:
-                base_map = Image.new("RGB", (mw, mh), bg_c)
+        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
-            cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-            x0 = cx - mw / 2.0; y0 = cy - mh / 2.0
-            xs_pix, ys_pix = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-            xs = np.rint(xs_pix - x0).astype(int)
-            ys = np.rint(ys_pix - y0).astype(int)
-            path_xy_full = list(zip(xs.tolist(), ys.tolist()))
-
-            map_layer = base_map.copy()
-            dmap = ImageDraw.Draw(map_layer)
-            dmap.line(path_xy_full, fill=map_path_c, width=3)
-            dmap.line(path_xy_full[:frame_idx+1], fill=map_current_path_c, width=4)
-            r = 6
-            dmap.ellipse((path_xy_full[frame_idx][0]-r, path_xy_full[frame_idx][1]-r,
-                          path_xy_full[frame_idx][0]+r, path_xy_full[frame_idx][1]+r), fill=map_current_point_c)
-
-            frame_img.paste(map_layer, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
-
-            draw_north_arrow(frame_img, map_area, 0.0, text_c)
-
-        else:
-
-            est_w = int(min(MAX_LARGE_DIM, mw * 6))
-            est_h = int(min(MAX_LARGE_DIM, mh * 6))
-            base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-            zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
-
-            xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-
-            x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-            y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-            track_w = x_max - x_min; track_h = y_max - y_min
+        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
+        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        track_w = x_max - x_min; track_h = y_max - y_min
 
 
-            patch_w = int(math.ceil(mw * PATCH_FACTOR))
-            patch_h = int(math.ceil(mh * PATCH_FACTOR))
-            margin_x = patch_w // 2 + 64
-            margin_y = patch_h // 2 + 64
-            width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-            height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
+        patch_w = int(math.ceil(mw * PATCH_FACTOR))
+        patch_h = int(math.ceil(mh * PATCH_FACTOR))
+        margin_x = patch_w // 2 + 64
+        margin_y = patch_h // 2 + 64
+        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
 
-            cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-            x0_world = cx - width_large / 2.0
-            y0_world = cy - height_large / 2.0
+        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
+        x0_world = cx - width_large / 2.0
+        y0_world = cy - height_large / 2.0
 
-            try:
-                base_map_img_large = render_base_map(
-                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
-                )
-            except Exception:
-                base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-
-            x_full = xs_world - x0_world
-            y_full = ys_world - y0_world
-
-            headings = []
-            for i in range(total_frames):
-                if i < total_frames - 1:
-                    dx = x_full[i + 1] - x_full[i]
-                    dy = y_full[i + 1] - y_full[i]
-                else:
-                    dx = x_full[i] - x_full[i - 1]
-                    dy = y_full[i] - y_full[i - 1]
-                if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-                    headings.append(math.atan2(dx, -dy))
-                else:
-                    headings.append(0.0)
-            complex_raw = np.exp(1j * np.array(headings))
-            win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-            smoothed_angles = []
-            for idx in range(total_frames):
-                w = int(win_sizes[idx])
-                half_w = w // 2
-                a = max(0, idx - half_w)
-                b = min(total_frames, idx + half_w + 1)
-                avg = np.mean(complex_raw[a:b])
-                smoothed_angles.append(math.atan2(avg.imag, avg.real))
-
-            xc = float(x_full[0])
-            yc = float(y_full[0])
-            patch_left = int(round(xc - patch_w / 2.0))
-            patch_top = int(round(yc - patch_h / 2.0))
-            patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
-
-            src_left = max(0, patch_left)
-            src_top = max(0, patch_top)
-            src_right = min(base_map_img_large.width, patch_left + patch_w)
-            src_bottom = min(base_map_img_large.height, patch_top + patch_h)
-            if src_right > src_left and src_bottom > src_top:
-                crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
-                dest_x = src_left - patch_left
-                dest_y = src_top - patch_top
-                patch_img.paste(crop, (dest_x, dest_y))
-
-            pdraw = ImageDraw.Draw(patch_img)
-            local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
-            pdraw.line(local_xy, fill=map_path_c, width=3)
-            pdraw.line(local_xy[:1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy[0]
-            r = 6
-            pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
-
-            speed_kmh0 = float(interp_speeds[0])
-            heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
-            patch_img = patch_img.rotate(
-                heading_deg,
-                resample=Image.BICUBIC,
-                expand=False,
-                center=(patch_w / 2.0, patch_h / 2.0),
+        try:
+            base_map_img_large = render_base_map(
+                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
             )
-            view_left = int(round(patch_w / 2.0 - mw / 2.0))
-            view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+        except Exception:
+            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-            frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+        x_full = xs_world - x0_world
+        y_full = ys_world - y0_world
 
-            draw_north_arrow(frame_img, map_area, heading_deg, text_c)
+        headings = []
+        for i in range(total_frames):
+            if i < total_frames - 1:
+                dx = x_full[i + 1] - x_full[i]
+                dy = y_full[i + 1] - y_full[i]
+            else:
+                dx = x_full[i] - x_full[i - 1]
+                dy = y_full[i] - y_full[i - 1]
+            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
+                headings.append(math.atan2(dx, -dy))
+            else:
+                headings.append(0.0)
+        complex_raw = np.exp(1j * np.array(headings))
+        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
+        smoothed_angles = []
+        for idx in range(total_frames):
+            w = int(win_sizes[idx])
+            half_w = w // 2
+            a = max(0, idx - half_w)
+            b = min(total_frames, idx + half_w + 1)
+            avg = np.mean(complex_raw[a:b])
+            smoothed_angles.append(math.atan2(avg.imag, avg.real))
+
+        xc = float(x_full[0])
+        yc = float(y_full[0])
+        patch_left = int(round(xc - patch_w / 2.0))
+        patch_top = int(round(yc - patch_h / 2.0))
+        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+
+        src_left = max(0, patch_left)
+        src_top = max(0, patch_top)
+        src_right = min(base_map_img_large.width, patch_left + patch_w)
+        src_bottom = min(base_map_img_large.height, patch_top + patch_h)
+        if src_right > src_left and src_bottom > src_top:
+            crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+            dest_x = src_left - patch_left
+            dest_y = src_top - patch_top
+            patch_img.paste(crop, (dest_x, dest_y))
+
+        pdraw = ImageDraw.Draw(patch_img)
+        local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
+        pdraw.line(local_xy, fill=map_path_c, width=3)
+        pdraw.line(local_xy[:1], fill=map_current_path_c, width=4)
+        cxp, cyp = local_xy[0]
+        r = 6
+        pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
+
+        speed_kmh0 = float(interp_speeds[0])
+        heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
+        patch_img = patch_img.rotate(
+            heading_deg,
+            resample=Image.BICUBIC,
+            expand=False,
+            center=(patch_w / 2.0, patch_h / 2.0),
+        )
+        view_left = int(round(patch_w / 2.0 - mw / 2.0))
+        view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+
+        frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+
+        draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
     except Exception as e:
         pass
@@ -1683,6 +1481,8 @@ def render_first_frame_image(
             gauge_bg_c,
             text_c,
         )
+    if compass_area.get("visible", False):
+        draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
     if info_area.get("visible", False):
         draw_info_text(draw,
                        float(interp_speeds[0]),
@@ -1767,7 +1567,6 @@ class GPXVideoApp:
             "text": "Texte",
             "gauge_background": "Fond jauge",
         }
-        self.fixed_map_view_var = tk.BooleanVar(value=False)
         self.progress_var = tk.IntVar(value=0)
         self.progress_bar = None
         self.generate_btn = None
@@ -1918,13 +1717,6 @@ class GPXVideoApp:
                                        values=[str(i) for i in range(1, 13)])
         self.zoom_combo.set(str(self.map_zoom_level_var.get()))
         self.zoom_combo.pack(fill=tk.X, pady=2)
-        ttk.Checkbutton(
-            gen_params_frame,
-            text="Carte fixe (afficher tout le tracé)",
-            variable=self.fixed_map_view_var
-        ).pack(fill=tk.X, pady=(4, 2))
-
-
         # Disposition des éléments (onglet dédié)
         elements_tab = ttk.Frame(config_panel_outer)
         config_panel_outer.add(elements_tab, text="Disposition")
@@ -2197,7 +1989,6 @@ class GPXVideoApp:
                 color_configs=self.color_configs,
                 map_style=self.map_style_var.get(),
                 zoom_level_ui=int(self.map_zoom_level_var.get()),
-                fixed_map_view=bool(self.fixed_map_view_var.get()),
             )
         except Exception as e:
             messagebox.showerror("Erreur", f"Aperçu impossible: {e}")
@@ -2270,7 +2061,7 @@ class GPXVideoApp:
                 "x": int(self.element_pos_entries_vars[name]["x"].get()),
                 "y": int(self.element_pos_entries_vars[name]["y"].get()),
                 "width": int(self.element_pos_entries_vars[name]["width"].get()),
-                "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else     [name]["height"],
+                "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else DEFAULT_ELEMENT_CONFIGS[name]["height"],
             }
 
         resolution = tuple(self.current_video_resolution)
@@ -2320,7 +2111,6 @@ class GPXVideoApp:
                     self.color_configs,
                     map_style=self.map_style_var.get(),
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
-                    fixed_map_view=bool(self.fixed_map_view_var.get()),
                     progress_callback=progress_cb,
                 )
             except Exception as e:
