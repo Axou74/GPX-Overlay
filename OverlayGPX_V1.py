@@ -20,6 +20,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageTk
 from scipy.interpolate import UnivariateSpline
 import xml.etree.ElementTree as ET  # <-- ajouté pour lire la FC dans les extensions GPX
 
+class TileFetchError(Exception):
+    """Erreur bloquante lors du téléchargement de tuiles."""
+    pass
+
+
 # --- Tuiles/cartes (optionnel) ---
 try:
     from staticmap import StaticMap  # type: ignore
@@ -33,10 +38,9 @@ MAP_TILE_SERVERS = {
     "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "Satellite ESRI": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
-    "OpenSnowMap": [
-        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
-        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
-    ],
+    "CyclOSM Forest": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    
 }
 
 # Zoom maximal supporté par chaque fournisseur de tuiles
@@ -44,6 +48,7 @@ MAX_ZOOM = {
     "OpenStreetMap": 19,
     "Satellite ESRI": 19,
     "CyclOSM (FR)": 19,
+    "CyclOSM Forest": 17,
     "OpenSnowMap": 18,
 }
 
@@ -124,6 +129,14 @@ DEFAULT_ELEMENT_CONFIGS = {
         "width": 200,
         "height": 80,
     },
+        "Boussole (ruban)": {
+        "visible": True,
+        "x": MARGIN,
+        "y": DEFAULT_RESOLUTION[1] // 2 + MARGIN,
+        "width": DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2,  # aligné sous la carte
+        "height": 70,
+    },
+
     # Augmente la hauteur pour accueillir Allure, FC et Pente
     "Infos Texte": {
         "visible": True,
@@ -318,6 +331,13 @@ def format_hms(seconds: int) -> str:
     """Format seconds into H:MM:SS."""
     return str(timedelta(seconds=int(max(0, seconds))))
 
+def _norm_heading_deg(a: float) -> float:
+    """Normalise un angle en degrés dans [0, 360)."""
+    a = float(a)
+    a = a % 360.0
+    return a if a >= 0 else a + 360.0
+
+
 # ---------- WebMercator helpers (clé pour une emprise fiable) ----------
 
 MERCATOR_LAT_MAX = 85.05112878
@@ -379,11 +399,13 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
             super().__init__(*args, **kwargs)
 
         def get(self, url, **kwargs):
+            # Récupération de tuile avec fallback CyclOSM -> OSM
             try:
                 status, content = super().get(url, **kwargs)
             except Exception:
                 status, content = 0, None
-            if status == 404 and "tile-cyclosm.openstreetmap.fr" in url:
+
+            if status != 200 and "tile-cyclosm.openstreetmap.fr" in url:
                 for sub in "abc":
                     alt = url.replace("//a.tile-cyclosm", f"//{sub}.tile-cyclosm")
                     try:
@@ -392,7 +414,7 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
                         status, content = 0, None
                     if status == 200:
                         break
-                if status == 404 or status == 0:
+                if status != 200:
                     alt = url.replace(
                         "a.tile-cyclosm.openstreetmap.fr/cyclosm",
                         "tile.openstreetmap.org",
@@ -401,16 +423,24 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
                         status, content = super().get(alt, **kwargs)
                     except Exception:
                         status, content = 0, None
+
+            # ⛔️ FAIL-FAST : si statut <> 200, on lève tout de suite
+            if status != 200:
+                raise TileFetchError(f"Échec téléchargement tuile: {url}")
+
             return status, content
 
         def render(self, zoom, center=None):
+            # On borne le zoom et on ne masque plus l’erreur
             zoom = min(zoom, self.max_zoom)
-            while zoom >= 0:
-                try:
-                    return super().render(zoom=zoom, center=center)
-                except Exception:
-                    zoom -= 1
-            raise RuntimeError("Failed to fetch tiles at any zoom level")
+            try:
+                return super().render(zoom=zoom, center=center)
+            except TileFetchError:
+                # Déjà une erreur explicite de tuile -> on propage
+                raise
+            except Exception as e:
+                # On convertit toute autre erreur en TileFetchError
+                raise TileFetchError(str(e)) from e
 
     return RetryingStaticMap(
         width,
@@ -422,9 +452,11 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
         max_zoom=max_zoom,
     )
 
+
 def render_base_map(width: int, height: int, map_style: str, zoom: int,
-                    lon_c: float, lat_c: float, bg_c: tuple[int, int, int]):
-    """Render a base map for the given style, handling composite layers."""
+                    lon_c: float, lat_c: float, bg_c: tuple[int, int, int],
+                    fail_on_tile_error: bool = True):
+    """Render une carte de fond. Si fail_on_tile_error=True, lève TileFetchError si une tuile échoue."""
     if map_style == "Aucun" or not STATICMAP_AVAILABLE:
         from PIL import Image
         return Image.new("RGB", (width, height), bg_c)
@@ -433,17 +465,29 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
     max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"])
     center = (lon_c, _clamp_lat(lat_c))
 
-    if isinstance(template, (list, tuple)):
-        base_url, overlay_url = template
-        base_s = make_static_map(width, height, base_url, max_zoom=max_zoom)
-        overlay_s = make_static_map(width, height, overlay_url, max_zoom=max_zoom)
-        base_img = base_s.render(zoom=zoom, center=center).convert("RGBA")
-        overlay_img = overlay_s.render(zoom=zoom, center=center).convert("RGBA")
-        base_img.paste(overlay_img, (0, 0), overlay_img)
-        return base_img.convert("RGB")
-    else:
-        s = make_static_map(width, height, template, max_zoom=max_zoom)
+    def _render_one(url_template):
+        s = make_static_map(width, height, url_template, max_zoom=max_zoom)
         return s.render(zoom=zoom, center=center).convert("RGB")
+
+    try:
+        if isinstance(template, (list, tuple)):
+            # couche de base
+            base_img = _render_one(template[0]).convert("RGBA")
+            # couches additionnelles
+            for overlay_url in template[1:]:
+                overlay_img = _render_one(overlay_url).convert("RGBA")
+                base_img.paste(overlay_img, (0, 0), overlay_img)
+            return base_img.convert("RGB")
+        else:
+            return _render_one(template)
+    except Exception as e:
+        if fail_on_tile_error:
+            if not isinstance(e, TileFetchError):
+                e = TileFetchError(str(e))
+            raise e
+        # Fallback facultatif (non utilisé si fail_on_tile_error=True)
+        from PIL import Image
+        return Image.new("RGB", (width, height), bg_c)
 
 # ---------- Graph helpers ----------
 
@@ -569,6 +613,126 @@ def draw_north_arrow(img, map_area, rotation_deg, color):
     pos_y = map_area["y"] + 10
     img.paste(arrow_img, (int(pos_x), int(pos_y)), arrow_img)
 
+def draw_compass_tape(draw, heading_deg: float, area: dict, font,
+                      text_color,
+                      bg_color=None,
+                      tick_color=(230, 230, 230),
+                      center_color=(255, 80, 80),
+                      stretch_x: float = 2.8,      # étirement horizontal (plus large)
+                      gap_above: int = -220,          # espace entre l'arc et le trait rouge
+                      marker_len: int = 70         # longueur du trait rouge
+                      ):
+    """
+    Demi-rose tournée 90° anti-horaire, TEXTES HORIZONTAUX.
+    - Ellipse élargie via stretch_x (>1).
+    - Ticks: 1°, 5°, 15° (labels tous les 15°).
+    - Marqueur: TRAIT ROUGE vertical juste au-dessus de l'arc (pas de label).
+    """
+    import math
+
+    # ---- Réglages visuels ----
+    total_span_deg = 120.0
+    arc_span_deg   = 120.0
+    arc_width      = 6
+    small_len      = 8
+    mid_len        = 14
+    big_len        = 22
+    label_gap      = 8
+
+    # ---- Zone ----
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    if w <= 0 or h <= 0:
+        return
+
+    # Centre sous la zone pour courbure vers le haut
+    cx = x + w / 2.0
+    cy = y + h + 6
+
+    # Rayon de base puis ellipse (rx, ry)
+    r_base = min(w / 2.0 - 4, h * 1.15)
+    if r_base <= 8:
+        return
+    rx = r_base * stretch_x
+    ry = r_base
+
+    # Rotation géométrique globale (CCW)
+    ROT = -90.0
+
+    # Arc en coordonnées PIL
+    arc_start = 180.0 - arc_span_deg / 2.0
+    arc_end   = 180.0 + arc_span_deg / 2.0
+    arc_start_r = arc_start + ROT
+    arc_end_r   = arc_end   + ROT
+
+    # BBox de l'ellipse et dessin de l'arc
+    bbox = [cx - rx, cy - ry, cx + rx, cy + ry]
+    draw.arc(bbox, start=arc_start_r, end=arc_end_r, fill=tick_color, width=arc_width)
+
+    # Utilitaires
+    def _norm(a):
+        a = float(a) % 360.0
+        return a if a >= 0 else a + 360.0
+
+    def label_for(d_int: int) -> str:
+        d_int = int(_norm(d_int))
+        return {0: "N", 90: "E", 180: "S", 270: "O"}.get(d_int, f"{d_int}")
+
+    hdg = _norm(heading_deg)
+
+    # map degré -> angle logique (valeurs plus grandes à GAUCHE)
+    def deg_to_theta(d):
+        delta = ((d - hdg + 540) % 360) - 180
+        if abs(delta) > (total_span_deg / 2.0) + 0.5:
+            return None
+        k = (delta + total_span_deg / 2.0) / total_span_deg
+        k = 1.0 - k
+        return arc_start + k * (arc_end - arc_start)
+
+    # coordonnées sur l'ellipse (en tenant compte de la rotation d'affichage)
+    def xy_on_ellipse(theta_deg, radius_add=0.0):
+        theta_r = math.radians(theta_deg + ROT)
+        rx_eff = rx + radius_add * (rx / r_base)
+        ry_eff = ry + radius_add * (ry / r_base)
+        return (cx + rx_eff * math.cos(theta_r),
+                cy + ry_eff * math.sin(theta_r))
+
+    # --- Ticks + labels 15° ---
+    start_d = int(math.floor(hdg - total_span_deg / 2.0)) - 1
+    end_d   = int(math.ceil(hdg + total_span_deg / 2.0)) + 1
+
+    for d in range(start_d, end_d + 1):
+        theta = deg_to_theta(d)
+        if theta is None:
+            continue
+        dd = int(_norm(d))
+
+        if dd % 15 == 0:
+            tlen = big_len; width = 2
+        elif dd % 5 == 0:
+            tlen = mid_len; width = 2
+        else:
+            tlen = small_len; width = 1
+
+        # graduation
+        x1, y1 = xy_on_ellipse(theta, radius_add = -arc_width * 0.5)
+        x2, y2 = xy_on_ellipse(theta, radius_add = -arc_width * 0.5 + tlen)
+        draw.line([(x1, y1), (x2, y2)], fill=tick_color, width=width)
+
+        # label 15° (texte horizontal)
+        if dd % 15 == 0:
+            lab = label_for(dd)
+            tx, ty = xy_on_ellipse(theta, radius_add = -arc_width * 0.5 + tlen + label_gap)
+            tb = draw.textbbox((0, 0), lab, font=font)
+            lw, lh = tb[2] - tb[0], tb[3] - tb[1]
+            draw.text((tx - lw / 2, ty - lh / 2), lab, font=font, fill=text_color)
+
+    # --- TRAIT ROUGE vertical juste au-dessus de l'arc ---
+    # Bord supérieur de l'ellipse + demi-épaisseur de trait de l'arc
+    y_top_arc_outer = (cy - ry) - arc_width * 0.5
+    y1 = y_top_arc_outer - gap_above           # point le plus proche de l'arc
+    y2 = y1 - marker_len                       # vers le haut
+    draw.line([(cx, y2), (cx, y1)], fill=center_color, width=4)
+
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
     bg_c = (color_configs.get("background", rgb_to_hex(BG_COLOR)) if color_configs else rgb_to_hex(BG_COLOR))
     grid_color = (50, 50, 50)
@@ -640,6 +804,8 @@ def generate_gpx_video(
     graph_current_point_c = (color_configs.get("graph_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
     text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
     gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
+    compass_area = element_configs.get("Boussole (ruban)", {})
+
 
     # GPX
     points, gpx_start, _ = parse_gpx(gpx_filename)
@@ -767,7 +933,7 @@ def generate_gpx_video(
 
             # Rendu du fond : pile à la taille du viewport
             try:
-                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c)
+                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True)
             except Exception as e:
                 print(f"Fond carte non dispo, fond uni utilisé (fixe): {e}")
                 base_map = Image.new("RGB", (mw, mh), bg_c)
@@ -891,6 +1057,10 @@ def generate_gpx_video(
                         gauge_bg_c,
                         text_c,
                     )
+                                # Boussole : cap fixe (Nord en haut)
+                if compass_area.get("visible", False):
+                    draw_compass_tape(draw, 0.0, compass_area, font_medium, text_c)
+
                 if gauge_cnt_area.get("visible", False):
                     draw_digital_speedometer(
                         draw,
@@ -947,7 +1117,7 @@ def generate_gpx_video(
             # Fond "large"
             try:
                 base_map_img_large = render_base_map(
-                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c
+                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
                 )
             except Exception as e:
                 print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
@@ -1129,6 +1299,10 @@ def generate_gpx_video(
                         gauge_bg_c,
                         text_c,
                     )
+                # Boussole : cap courant
+                if compass_area.get("visible", False):
+                    draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
+
                 if info_area.get("visible", False):
                     draw_info_text(draw,
                                    float(interp_speeds[frame_idx]),
@@ -1236,6 +1410,8 @@ def render_first_frame_image(
     gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
     gauge_cnt_area  = element_configs.get("Jauge Vitesse Compteur", {})
     info_area  = element_configs.get("Infos Texte", {})
+    compass_area = element_configs.get("Boussole (ruban)", {})
+
 
     mw = int(map_area.get("width", 0)); mh = int(map_area.get("height", 0))
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
@@ -1288,7 +1464,7 @@ def render_first_frame_image(
             zoom = max(1, min(19, base_zoom + zoom_offset))
 
             try:
-                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c)
+                base_map = render_base_map(mw, mh, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True)
             except Exception:
                 base_map = Image.new("RGB", (mw, mh), bg_c)
 
@@ -1338,7 +1514,7 @@ def render_first_frame_image(
 
             try:
                 base_map_img_large = render_base_map(
-                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c
+                    width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
                 )
             except Exception:
                 base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
@@ -2094,7 +2270,7 @@ class GPXVideoApp:
                 "x": int(self.element_pos_entries_vars[name]["x"].get()),
                 "y": int(self.element_pos_entries_vars[name]["y"].get()),
                 "width": int(self.element_pos_entries_vars[name]["width"].get()),
-                "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else DEFAULT_ELEMENT_CONFIGS[name]["height"],
+                "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else     [name]["height"],
             }
 
         resolution = tuple(self.current_video_resolution)
@@ -2111,41 +2287,46 @@ class GPXVideoApp:
         start_time = time.time()
 
         def run_generation():
+            error_msg = None
+        
             def progress_cb(pct):
                 if pct > 0:
                     elapsed = time.time() - start_time
                     remaining = elapsed * (100 - pct) / pct
                 else:
                     remaining = 0
-
                 def updater():
                     self.progress_var.set(pct)
                     if pct > 0:
                         self.progress_time_var.set(format_hms(int(remaining)))
                 self.master.after(0, updater)
-
-            font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
-            font_size = max(10, int(self.font_size_var.get()))
-            global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
-            FONT_SIZE_LARGE = font_size
-            FONT_SIZE_MEDIUM = int(font_size * 0.75)
-
-            success = generate_gpx_video(
-                self.gpx_file_path,
-                output_file,
-                int(self.start_offset_var.get()),
-                duration,
-                fps,
-                resolution,
-                font_path,
-                element_configs,
-                self.color_configs,
-                map_style=self.map_style_var.get(),
-                zoom_level_ui=int(self.map_zoom_level_var.get()),
-                fixed_map_view=bool(self.fixed_map_view_var.get()),
-                progress_callback=progress_cb,
-            )
-
+        
+            try:
+                font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
+                font_size = max(10, int(self.font_size_var.get()))
+                global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
+                FONT_SIZE_LARGE = font_size
+                FONT_SIZE_MEDIUM = int(font_size * 0.75)
+        
+                success = generate_gpx_video(
+                    self.gpx_file_path,
+                    output_file,
+                    int(self.start_offset_var.get()),
+                    duration,
+                    fps,
+                    resolution,
+                    font_path,
+                    element_configs,
+                    self.color_configs,
+                    map_style=self.map_style_var.get(),
+                    zoom_level_ui=int(self.map_zoom_level_var.get()),
+                    fixed_map_view=bool(self.fixed_map_view_var.get()),
+                    progress_callback=progress_cb,
+                )
+            except Exception as e:
+                success = False
+                error_msg = str(e)
+        
             def finalize():
                 self.generate_btn.config(state=tk.NORMAL)
                 self.progress_var.set(0)
@@ -2153,9 +2334,13 @@ class GPXVideoApp:
                 if success:
                     messagebox.showinfo("Succès", "La vidéo a été générée avec succès!")
                 else:
-                    messagebox.showerror("Erreur", "Une erreur est survenue lors de la génération de la vidéo.")
-
+                    if error_msg:
+                        messagebox.showerror("Erreur", f"Échec génération : {error_msg}")
+                    else:
+                        messagebox.showerror("Erreur", "Une erreur est survenue lors de la génération de la vidéo.")
+        
             self.master.after(0, finalize)
+
 
         threading.Thread(target=run_generation, daemon=True).start()
 
