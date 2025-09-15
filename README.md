@@ -33,3 +33,4 @@ Personnalisation complète des couleurs
 Disposition libre de chaque élément
 
 📸 Aperçu instantané de la première image avant rendu complet
+💾 Vidéo enregistrée automatiquement au même emplacement que le fichier GPX avec le même nom

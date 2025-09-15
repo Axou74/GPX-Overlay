@@ -9,10 +9,6 @@ import sys, time
 import threading
 import imageio.v2 as imageio
 
-import threading
-
-import imageio.v2 as imageio
-
 import gpxpy
 import numpy as np
 import pytz
@@ -1567,8 +1563,6 @@ class GPXVideoApp:
             "text": "Texte",
             "gauge_background": "Fond jauge",
         }
-        self.progress_var = tk.IntVar(value=0)
-        self.progress_bar = None
         self.generate_btn = None
         self.create_widgets()
         self.populate_initial_element_ratios()
@@ -1640,11 +1634,6 @@ class GPXVideoApp:
         self.gpx_toolbar_label_var = tk.StringVar(value="GPX: aucun")
         ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var).pack(side=tk.LEFT, padx=6)
 
-        self.progress_time_var = tk.StringVar(value="")
-        ttk.Label(toolbar, textvariable=self.progress_time_var).pack(side=tk.RIGHT, padx=6)
-
-        self.progress_bar = ttk.Progressbar(toolbar, variable=self.progress_var, length=150, maximum=100)
-        self.progress_bar.pack(side=tk.RIGHT, padx=6, fill=tk.X, expand=True)
 
         # Colonne gauche avec onglets pour condenser l'interface
         config_panel_outer = ttk.Notebook(main_frame); self.config_panel_outer = config_panel_outer
@@ -2065,32 +2054,12 @@ class GPXVideoApp:
             }
 
         resolution = tuple(self.current_video_resolution)
-        output_file = filedialog.asksaveasfilename(
-            title="Enregistrer la vidéo sous...",
-            defaultextension=".mp4",
-            filetypes=[("Fichiers vidéo MP4", "*.mp4"), ("Tous les fichiers", "*.*")],
-        )
-        if not output_file: return
+        output_file = os.path.splitext(self.gpx_file_path)[0] + ".mp4"
 
         self.generate_btn.config(state=tk.DISABLED)
-        self.progress_var.set(0)
-        self.progress_time_var.set("")
-        start_time = time.time()
 
         def run_generation():
             error_msg = None
-        
-            def progress_cb(pct):
-                if pct > 0:
-                    elapsed = time.time() - start_time
-                    remaining = elapsed * (100 - pct) / pct
-                else:
-                    remaining = 0
-                def updater():
-                    self.progress_var.set(pct)
-                    if pct > 0:
-                        self.progress_time_var.set(format_hms(int(remaining)))
-                self.master.after(0, updater)
         
             try:
                 font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
@@ -2111,7 +2080,6 @@ class GPXVideoApp:
                     self.color_configs,
                     map_style=self.map_style_var.get(),
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
-                    progress_callback=progress_cb,
                 )
             except Exception as e:
                 success = False
@@ -2119,10 +2087,8 @@ class GPXVideoApp:
         
             def finalize():
                 self.generate_btn.config(state=tk.NORMAL)
-                self.progress_var.set(0)
-                self.progress_time_var.set("")
                 if success:
-                    messagebox.showinfo("Succès", "La vidéo a été générée avec succès!")
+                    messagebox.showinfo("Succès", f"La vidéo a été générée avec succès\n{output_file}")
                 else:
                     if error_msg:
                         messagebox.showerror("Erreur", f"Échec génération : {error_msg}")
