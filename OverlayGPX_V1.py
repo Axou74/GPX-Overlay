@@ -968,26 +968,35 @@ def generate_gpx_video(
         y_full = ys_world - y0_world
 
         # Tête lissée (pour rotation)
-        headings = []
-        for i in range(total_frames):
-            if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]; dy = y_full[i + 1] - y_full[i]
-            else:
-                dx = x_full[i] - x_full[i - 1]; dy = y_full[i] - y_full[i - 1]
-            headings.append(math.atan2(dx, -dy) if (abs(dx) > 1e-9 or abs(dy) > 1e-9) else 0.0)
-        complex_raw = np.exp(1j * np.array(headings))
-        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-        smoothed_angles = []
-        for idx in range(total_frames):
-            w = int(win_sizes[idx])
-            half_w = w // 2
-            a = max(0, idx - half_w)
-            b = min(total_frames, idx + half_w + 1)
-            avg = np.mean(complex_raw[a:b])
-            smoothed_angles.append(math.atan2(avg.imag, avg.real))
+        if total_frames == 0:
+            smoothed_angles = np.zeros(0, dtype=float)
+        else:
+            dx = np.zeros(total_frames, dtype=float)
+            dy = np.zeros(total_frames, dtype=float)
+            if total_frames > 1:
+                dx[:-1] = np.diff(x_full)
+                dy[:-1] = np.diff(y_full)
+                dx[-1] = x_full[-1] - x_full[-2]
+                dy[-1] = y_full[-1] - y_full[-2]
+            headings = np.zeros(total_frames, dtype=float)
+            non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
+            headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
+
+            complex_raw = np.exp(1j * headings)
+            win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
+            half_windows = win_sizes // 2
+            indices = np.arange(total_frames)
+            start_idx = np.maximum(indices - half_windows, 0)
+            end_idx = np.minimum(indices + half_windows + 1, total_frames)
+
+            cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
+            counts = (end_idx - start_idx).astype(float)
+            counts[counts == 0] = 1.0
+            averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
+            smoothed_angles = np.arctan2(averages.imag, averages.real)
 
         # Rendu images -> flux vidéo
-        last_heading_deg = math.degrees(smoothed_angles[0])
+        last_heading_deg = math.degrees(smoothed_angles[0]) if total_frames else 0.0
 
         for frame_idx in range(total_frames):
             frame_img = Image.new("RGB", resolution, bg_c)
