@@ -34,9 +34,22 @@ MAP_TILE_SERVERS = {
     "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "Satellite ESRI": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
-    "CyclOSM Forest": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    "Topo": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
     "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
-    
+
+    # >>> styles composites (ordre = du fond vers le dessus)
+    "Topo + OpenSnowMap": [
+        "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
+    "OSM + OpenSnowMap": [
+        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
+    "Satellite + OpenSnowMap": [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
 }
 
 # Zoom maximal supporté par chaque fournisseur de tuiles
@@ -44,8 +57,11 @@ MAX_ZOOM = {
     "OpenStreetMap": 19,
     "Satellite ESRI": 19,
     "CyclOSM (FR)": 19,
-    "CyclOSM Forest": 17,
+    "Topo": 17,
     "OpenSnowMap": 18,
+    "Topo + OpenSnowMap": 17,
+    "OSM + OpenSnowMap": 18,
+    "Satellite + OpenSnowMap": 18,
 }
 
 # --- Réglages géométrie et apparence ---
@@ -397,7 +413,13 @@ def zoom_level_ui_to_offset(level_ui: int) -> int:
     level_ui = max(1, min(12, int(level_ui)))
     return level_ui - 8
 
-def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 19):
+def make_static_map(
+    width: int,
+    height: int,
+    url_template: str,
+    max_zoom: int = 19,
+    background: tuple[int, int, int, int] = (255, 255, 255, 255),
+):
     """Return a StaticMap instance with retry logic and zoom clamping."""
     from staticmap import StaticMap  # type: ignore
 
@@ -458,6 +480,7 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
         padding_y=0,
         delay_between_retries=1,
         max_zoom=max_zoom,
+        backgroundcolor=background,
     )
 
 
@@ -473,21 +496,35 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
     max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"])
     center = (lon_c, _clamp_lat(lat_c))
 
-    def _render_one(url_template):
-        s = make_static_map(width, height, url_template, max_zoom=max_zoom)
-        return s.render(zoom=zoom, center=center).convert("RGB")
+    def _render_one(url_template, transparent=False):
+        bg = (0, 0, 0, 0) if transparent else (255, 255, 255, 255)
+        s = make_static_map(
+            width,
+            height,
+            url_template,
+            max_zoom=max_zoom,
+            background=bg,
+        )
+        return s.render(zoom=zoom, center=center)
 
     try:
         if isinstance(template, (list, tuple)):
             # couche de base
-            base_img = _render_one(template[0]).convert("RGBA")
+            base_img = _render_one(template[0])
+            if base_img.mode != "RGBA":
+                base_img = base_img.convert("RGBA")
             # couches additionnelles
             for overlay_url in template[1:]:
-                overlay_img = _render_one(overlay_url).convert("RGBA")
+                overlay_img = _render_one(overlay_url, transparent=True)
+                if overlay_img.mode != "RGBA":
+                    overlay_img = overlay_img.convert("RGBA")
                 base_img.paste(overlay_img, (0, 0), overlay_img)
             return base_img.convert("RGB")
         else:
-            return _render_one(template)
+            img = _render_one(template)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            return img
     except Exception as e:
         if fail_on_tile_error:
             if not isinstance(e, TileFetchError):
