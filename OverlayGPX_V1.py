@@ -34,9 +34,22 @@ MAP_TILE_SERVERS = {
     "OpenStreetMap": "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
     "Satellite ESRI": "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
     "CyclOSM (FR)": "https://a.tile-cyclosm.openstreetmap.fr/cyclosm/{z}/{x}/{y}.png",
-    "CyclOSM Forest": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+    "Topo": "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
     "OpenSnowMap": "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
-    
+
+    # >>> styles composites (ordre = du fond vers le dessus)
+    "Topo + OpenSnowMap": [
+        "https://a.tile.opentopomap.org/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
+    "OSM + OpenSnowMap": [
+        "https://tile.openstreetmap.org/{z}/{x}/{y}.png",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
+    "Satellite + OpenSnowMap": [
+        "https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        "https://tiles.opensnowmap.org/pistes/{z}/{x}/{y}.png",
+    ],
 }
 
 # Zoom maximal supporté par chaque fournisseur de tuiles
@@ -44,8 +57,11 @@ MAX_ZOOM = {
     "OpenStreetMap": 19,
     "Satellite ESRI": 19,
     "CyclOSM (FR)": 19,
-    "CyclOSM Forest": 17,
+    "Topo": 17,
     "OpenSnowMap": 18,
+    "Topo + OpenSnowMap": 17,
+    "OSM + OpenSnowMap": 18,
+    "Satellite + OpenSnowMap": 18,
 }
 
 # --- Réglages géométrie et apparence ---
@@ -475,19 +491,26 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
 
     def _render_one(url_template):
         s = make_static_map(width, height, url_template, max_zoom=max_zoom)
-        return s.render(zoom=zoom, center=center).convert("RGB")
+        return s.render(zoom=zoom, center=center)
 
     try:
         if isinstance(template, (list, tuple)):
             # couche de base
-            base_img = _render_one(template[0]).convert("RGBA")
+            base_img = _render_one(template[0])
+            if base_img.mode != "RGBA":
+                base_img = base_img.convert("RGBA")
             # couches additionnelles
             for overlay_url in template[1:]:
-                overlay_img = _render_one(overlay_url).convert("RGBA")
+                overlay_img = _render_one(overlay_url)
+                if overlay_img.mode != "RGBA":
+                    overlay_img = overlay_img.convert("RGBA")
                 base_img.paste(overlay_img, (0, 0), overlay_img)
             return base_img.convert("RGB")
         else:
-            return _render_one(template)
+            img = _render_one(template)
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            return img
     except Exception as e:
         if fail_on_tile_error:
             if not isinstance(e, TileFetchError):
