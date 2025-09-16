@@ -1040,9 +1040,6 @@ def generate_gpx_video(
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
-            draw_north_arrow(frame_img, map_area, heading_deg, text_c)
-
-
             # Profils & infos
             if elev_area.get("visible", False):
                 draw_graph(
