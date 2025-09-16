@@ -550,6 +550,126 @@ def draw_graph(
     draw.text((draw_area["x"], draw_area["y"] + draw_area["height"] + 10), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
     draw.text((draw_area["x"] + draw_area["width"] - 200, draw_area["y"] + draw_area["height"] + 10), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
 
+
+def is_area_visible(area: dict | None) -> bool:
+    """Retourne True si la zone est visible et possède des dimensions non nulles."""
+    if not area:
+        return False
+    return bool(area.get("visible", False) and area.get("width", 0) > 0 and area.get("height", 0) > 0)
+
+
+def create_graph_background_image(
+    resolution: tuple[int, int],
+    path_coords: list[tuple[int, int]],
+    min_val: float,
+    max_val: float,
+    draw_area: dict,
+    font,
+    title: str,
+    unit: str,
+    base_color,
+    text_color,
+) -> Image.Image:
+    """Crée une image transparente contenant axes, graduations et courbe complète."""
+
+    bg_img = Image.new("RGBA", resolution, (0, 0, 0, 0))
+    if not is_area_visible(draw_area):
+        return bg_img
+
+    draw = ImageDraw.Draw(bg_img)
+
+    x0 = int(draw_area.get("x", 0))
+    y0 = int(draw_area.get("y", 0))
+    width = int(draw_area.get("width", 0))
+    height = int(draw_area.get("height", 0))
+
+    nb_ticks = 4
+    for i in range(nb_ticks + 1):
+        val = min_val + (max_val - min_val) * i / nb_ticks
+        y = y0 + int((max_val - val) / ((max_val - min_val) + 1e-10) * height)
+        draw.line([(x0, y), (x0 + width, y)], fill=(80, 80, 80), width=1)
+        val_str = f"{val:.0f}"
+        text_bbox = draw.textbbox((0, 0), val_str, font=font)
+        text_w = text_bbox[2] - text_bbox[0]
+        text_h = text_bbox[3] - text_bbox[1]
+        draw.text((x0 - text_w - 10, y - text_h / 2), val_str, font=font, fill=text_color)
+
+    future_color = darken_color(base_color, 0.8)
+    if len(path_coords) >= 2:
+        draw.line(path_coords, fill=future_color, width=4)
+    elif len(path_coords) == 1:
+        cx, cy = path_coords[0]
+        draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
+
+    text_y = y0 + height + 10
+    draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
+    draw.text((x0 + width - 200, text_y), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
+
+    return bg_img
+
+
+def draw_graph_progress_overlay(
+    draw: ImageDraw.ImageDraw,
+    path_coords: list[tuple[int, int]],
+    current_index: int,
+    base_color,
+    current_point_color,
+    point_size: int = 4,
+) -> None:
+    """Dessine la portion courante et le point actuel sur un graphe pré-dessiné."""
+
+    if not path_coords:
+        return
+
+    idx = max(0, min(current_index, len(path_coords) - 1))
+    if idx >= 1:
+        draw.line(path_coords[: idx + 1], fill=base_color, width=5)
+
+    cx, cy = path_coords[idx]
+    draw.ellipse((cx - point_size, cy - point_size, cx + point_size, cy + point_size), fill=current_point_color)
+
+
+def prepare_graph_layers(
+    resolution: tuple[int, int],
+    font,
+    text_color,
+    point_color,
+    graph_specs: list[tuple[dict, list[tuple[int, int]], float, float, str, str, tuple[int, int, int]]],
+) -> list[dict]:
+    """Prépare les couches de graphes (fond pré-rendu + méta-données)."""
+
+    layers: list[dict] = []
+    for area, path_coords, min_val, max_val, title, unit, base_color in graph_specs:
+        if not is_area_visible(area):
+            continue
+        background = create_graph_background_image(
+            resolution,
+            path_coords,
+            min_val,
+            max_val,
+            area,
+            font,
+            title,
+            unit,
+            base_color,
+            text_color,
+        )
+        layers.append(
+            {
+                "area": area,
+                "path": path_coords,
+                "min": min_val,
+                "max": max_val,
+                "title": title,
+                "unit": unit,
+                "base_color": base_color,
+                "point_color": point_color,
+                "background": background,
+                "point_size": 4,
+            }
+        )
+    return layers
+
 def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     x0, y0 = draw_area["x"], draw_area["y"]
     w, h = draw_area["width"], draw_area["height"]
@@ -924,6 +1044,21 @@ def generate_gpx_video(
     hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
     hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
 
+    graph_specs = [
+        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
+        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
+        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
+    ]
+    if has_hr:
+        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+    graph_layers = prepare_graph_layers(
+        resolution,
+        font_medium,
+        text_c,
+        graph_current_point_c,
+        graph_specs,
+    )
+
     try:
 
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
@@ -1055,68 +1190,16 @@ def generate_gpx_video(
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
             # Profils & infos
-            if elev_area.get("visible", False):
-                draw_graph(
+            for layer in graph_layers:
+                frame_img.paste(layer["background"], (0, 0), layer["background"])
+            for layer in graph_layers:
+                draw_graph_progress_overlay(
                     draw,
-                    elev_path,
+                    layer["path"],
                     frame_idx,
-                    elev_min,
-                    elev_max,
-                    elev_area,
-                    font_medium,
-                    "Altitude",
-                    "m",
-                    alt_path_c,
-                    graph_current_point_c,
-                    text_c,
-                )
-            if speed_area.get("visible", False):
-                draw_graph(
-                    draw,
-                    speed_path,
-                    frame_idx,
-
-                    speed_min_val,
-                    speed_max_val,
-
-                    speed_area,
-                    font_medium,
-                    "Vitesse",
-                    "km/h",
-                    speed_path_c,
-                    graph_current_point_c,
-                    text_c,
-                )
-            # --- AJOUTS : Allure & Cardio ---
-            if pace_area.get("visible", False):
-                draw_graph(
-                    draw,
-                    pace_path,
-                    frame_idx,
-                    pace_min,
-                    pace_max,
-                    pace_area,
-                    font_medium,
-                    "Allure",
-                    "min/km",
-                    pace_path_c,
-                    graph_current_point_c,
-                    text_c,
-                )
-            if hr_area.get("visible", False) and has_hr:
-                draw_graph(
-                    draw,
-                    hr_path,
-                    frame_idx,
-                    hr_min,
-                    hr_max,
-                    hr_area,
-                    font_medium,
-                    "FC",
-                    "bpm",
-                    hr_path_c,
-                    graph_current_point_c,
-                    text_c,
+                    layer["base_color"],
+                    layer["point_color"],
+                    layer["point_size"],
                 )
 
             if gauge_circ_area.get("visible", False):
@@ -1300,6 +1383,21 @@ def render_first_frame_image(
     hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
     hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
 
+    graph_specs = [
+        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
+        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
+        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
+    ]
+    if has_hr:
+        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+    graph_layers = prepare_graph_layers(
+        resolution,
+        font_medium,
+        text_c,
+        graph_current_point_c,
+        graph_specs,
+    )
+
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
     frame_idx = 0
@@ -1409,68 +1507,16 @@ def render_first_frame_image(
     except Exception as e:
         pass
 
-    if elev_area.get("visible", False):
-        draw_graph(
+    for layer in graph_layers:
+        frame_img.paste(layer["background"], (0, 0), layer["background"])
+    for layer in graph_layers:
+        draw_graph_progress_overlay(
             draw,
-            elev_path,
+            layer["path"],
             0,
-            elev_min,
-            elev_max,
-            elev_area,
-            font_medium,
-            "Altitude",
-            "m",
-            alt_path_c,
-            graph_current_point_c,
-            text_c,
-        )
-    if speed_area.get("visible", False):
-        draw_graph(
-            draw,
-            speed_path,
-            0,
-
-            speed_min_val,
-            speed_max_val,
-
-            speed_area,
-            font_medium,
-            "Vitesse",
-            "km/h",
-            speed_path_c,
-            graph_current_point_c,
-            text_c,
-        )
-    # --- AJOUTS : Allure & Cardio (aperçu frame 0) ---
-    if pace_area.get("visible", False):
-        draw_graph(
-            draw,
-            pace_path,
-            0,
-            pace_min,
-            pace_max,
-            pace_area,
-            font_medium,
-            "Allure",
-            "min/km",
-            pace_path_c,
-            graph_current_point_c,
-            text_c,
-        )
-    if hr_area.get("visible", False) and has_hr:
-        draw_graph(
-            draw,
-            hr_path,
-            0,
-            hr_min,
-            hr_max,
-            hr_area,
-            font_medium,
-            "FC",
-            "bpm",
-            hr_path_c,
-            graph_current_point_c,
-            text_c,
+            layer["base_color"],
+            layer["point_color"],
+            layer["point_size"],
         )
 
     if gauge_circ_area.get("visible", False):
