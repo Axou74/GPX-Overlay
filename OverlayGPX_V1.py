@@ -966,6 +966,8 @@ def generate_gpx_video(
         # Trace dans le repère "large"
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
+        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        local_xy_buffer = np.empty_like(global_xy)
 
         # Tête lissée (pour rotation)
         headings = []
@@ -1011,11 +1013,14 @@ def generate_gpx_video(
 
             # Trace + progression + point (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
-            local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
-            pdraw.line(local_xy, fill=map_path_c, width=3)
-            pdraw.line(local_xy[: frame_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy[frame_idx]; r = 6
-            pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
+            np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
+            np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
+            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+            pdraw.line(local_xy_list, fill=map_path_c, width=3)
+            pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
+            cxp, cyp = local_xy_buffer[frame_idx]
+            r = 6
+            pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
             # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[frame_idx])
@@ -1324,6 +1329,8 @@ def render_first_frame_image(
 
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
+        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        local_xy_buffer = np.empty_like(global_xy)
 
         headings = []
         for i in range(total_frames):
@@ -1365,12 +1372,14 @@ def render_first_frame_image(
             patch_img.paste(crop, (dest_x, dest_y))
 
         pdraw = ImageDraw.Draw(patch_img)
-        local_xy = [(int(round(xx - patch_left)), int(round(yy - patch_top))) for xx, yy in zip(x_full, y_full)]
-        pdraw.line(local_xy, fill=map_path_c, width=3)
-        pdraw.line(local_xy[:1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy[0]
+        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
+        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
+        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+        pdraw.line(local_xy_list, fill=map_path_c, width=3)
+        pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
+        cxp, cyp = local_xy_buffer[0]
         r = 6
-        pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
+        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
         speed_kmh0 = float(interp_speeds[0])
         heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
