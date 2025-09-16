@@ -701,14 +701,129 @@ def draw_linear_speedometer(draw, speed, speed_min, speed_max, draw_area, font, 
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
     draw.text((x + w/2 - text_w/2, y + h/2 - text_h/2), speed_text, font=font, fill=text_color)
 
-def draw_digital_speedometer(draw, speed, draw_area, font, gauge_bg_color, text_color):
-    x, y = draw_area["x"], draw_area["y"]
+def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
+    """
+    Compteur de vitesse demi-circulaire (aucun fond).
+    - Graduations mineures + majeures (texte sur l'arc).
+    - Aiguille rouge + pivot blanc.
+    - Les deux dernières valeurs majeures (ex: 220 et 240) en ROUGE.
+    Signature conservée; gauge_bg_color n'est pas utilisée (pas de fond).
+    """
+    import math
+
+    x0, y0 = draw_area["x"], draw_area["y"]
     w, h = draw_area["width"], draw_area["height"]
-    draw.rectangle([x, y, x + w, y + h], fill=gauge_bg_color)
-    speed_text = f"{speed:.0f}"
-    text_bbox = draw.textbbox((0, 0), speed_text, font=font)
-    text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
-    draw.text((x + w/2 - text_w/2, y + h/2 - text_h/2), speed_text, font=font, fill=text_color)
+
+    # Géométrie générale : demi-cercle 180°→360°, centre en bas au milieu
+    pad = 6
+    radius = max(1.0, min(w / 2.0, h) - pad)
+    cx = x0 + w / 2.0
+    cy = y0 + h - pad
+
+    # Sécurité et normalisation
+    if speed_max <= speed_min:
+        return
+    speed_clamped = max(speed_min, min(speed_max, speed))
+
+    # Choix des pas de graduation
+    span = float(speed_max - speed_min)
+    # Heuristique simple pour un pas "propre"
+    candidate_maj = [5, 10, 20, 25, 50]
+    major_step = min(candidate_maj, key=lambda s: abs((span / s) - round(span / s)))
+    # Garde-fous
+    if span / major_step > 16:
+        major_step *= 2
+    if span / major_step < 6:
+        major_step = max(5, major_step // 2) if major_step >= 10 else major_step
+    minor_step = max(1, major_step // 5)
+
+    # Les deux dernières valeurs majeures à colorer en rouge
+    last_major_1 = (speed_max // major_step) * major_step
+    last_major_2 = last_major_1 - major_step
+    red_values = {last_major_1, last_major_2}
+    RED = (255, 0, 0)
+
+    def value_to_angle(val: float) -> float:
+        """Mappe speed_min..speed_max → 180..360 (degrés)."""
+        frac = (val - speed_min) / span
+        frac = max(0.0, min(1.0, frac))
+        return 180.0 + 180.0 * frac
+
+    # Longueurs de traits
+    tick_len_major = radius * 0.16
+    tick_len_minor = radius * 0.09
+    tick_w_major = 3
+    tick_w_minor = 2
+
+    # Dessin des ticks mineurs
+    v = (speed_min // minor_step) * minor_step
+    if v < speed_min:
+        v += minor_step
+    while v <= speed_max + 1e-6:
+        ang = math.radians(value_to_angle(v))
+        # Choix longueur/largeur
+        is_major = (v % major_step == 0)
+        L = tick_len_major if is_major else tick_len_minor
+        ww = tick_w_major if is_major else tick_w_minor
+        col = text_color
+        if is_major and v in red_values:
+            col = RED
+        # ligne radiale
+        x1 = cx + (radius - L) * math.cos(ang)
+        y1 = cy + (radius - L) * math.sin(ang)
+        x2 = cx + (radius - 2) * math.cos(ang)
+        y2 = cy + (radius - 2) * math.sin(ang)
+        draw.line([(x1, y1), (x2, y2)], fill=col, width=ww)
+        v += minor_step
+
+    # Libellés des valeurs majeures (suivent l'arc, légèrement inclinés)
+    v = (speed_min // major_step) * major_step
+    if v < speed_min:
+        v += major_step
+    while v <= speed_max + 1e-6:
+        ang_deg = value_to_angle(v)
+        ang = math.radians(ang_deg)
+        label = f"{int(v)}"
+        # Mesure initiale
+        tb = draw.textbbox((0, 0), label, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+        # Position sur l'arc (un peu à l'extérieur des ticks)
+        r_text = radius - tick_len_major - th * 0.2
+        tx = cx + r_text * math.cos(ang) - tw / 2
+        ty = cy + r_text * math.sin(ang) - th / 2
+
+        # Couleur (rouge pour les 2 dernières)
+        col = RED if v in red_values else text_color
+
+        # Légère rotation tangentielle pour suivre la courbure
+        # On crée un petit calque texte, on le fait pivoter puis on le colle.
+        # (Évite de remplir un fond : calque transparent.)
+        try:
+            from PIL import Image, ImageDraw  # type: ignore
+
+            canv_w = int(tw * 2)
+            canv_h = int(th * 2)
+            tmp = Image.new("RGBA", (canv_w, canv_h), (0, 0, 0, 0))
+            td = ImageDraw.Draw(tmp)
+            td.text(((canv_w - tw) / 2, (canv_h - th) / 2), label, font=font, fill=col)
+            rot = ang_deg + 90.0
+            tmp = tmp.rotate(rot, resample=Image.BICUBIC, expand=True)
+            paste_x = int(tx - (tmp.width - tw) / 2)
+            paste_y = int(ty - (tmp.height - th) / 2)
+            draw.im.paste(tmp, (paste_x, paste_y), tmp)
+        except Exception:
+            draw.text((tx, ty), label, font=font, fill=col)
+        v += major_step
+
+    # Aiguille (rouge) + pivot (blanc)
+    ang = math.radians(value_to_angle(speed_clamped))
+    needle_r = radius - 2
+    nx = cx + needle_r * math.cos(ang)
+    ny = cy + needle_r * math.sin(ang)
+    draw.line([(cx, cy), (nx, ny)], fill=RED, width=3)
+    pivot_r = max(3, int(radius * 0.04))
+    draw.ellipse([cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r], fill=(255, 255, 255))
 
 def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
     display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
@@ -1228,6 +1343,8 @@ def generate_gpx_video(
                 draw_digital_speedometer(
                     draw,
                     float(interp_speeds[frame_idx]),
+                    speed_min,
+                    speed_max,
                     gauge_cnt_area,
                     font_medium,
                     gauge_bg_c,
@@ -1545,6 +1662,8 @@ def render_first_frame_image(
         draw_digital_speedometer(
             draw,
             float(interp_speeds[0]),
+            speed_min,
+            speed_max,
             gauge_cnt_area,
             font_medium,
             gauge_bg_c,
