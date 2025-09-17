@@ -64,6 +64,8 @@ GAUGE_BG_COLOR = (30, 30, 30)
 
 FONT_SIZE_LARGE = 40
 FONT_SIZE_MEDIUM = 20
+GRAPH_FONT_SCALE = 0.7
+MIN_GRAPH_FONT_SIZE = 4
 MARGIN = 10
 GRAPH_PADDING = 100
 
@@ -79,6 +81,13 @@ INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
 INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
 INFO_TEXT_Y = 450
 GAUGE_BASE_Y = 900
+
+
+def compute_graph_font_size(medium_size: int) -> int:
+    """Calcule une taille de police dédiée aux graphiques, réduite d'environ 30 %."""
+
+    scaled_size = int(medium_size * GRAPH_FONT_SCALE)
+    return max(MIN_GRAPH_FONT_SIZE, scaled_size)
 
 DEFAULT_ELEMENT_CONFIGS = {
     "Carte": {
@@ -1090,12 +1099,15 @@ def generate_gpx_video(
     VERTICAL_BIAS = 0.65
 
     # Polices & couleurs
+    graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
     try:
         font_large = ImageFont.truetype(font_path, FONT_SIZE_LARGE)
         font_medium = ImageFont.truetype(font_path, FONT_SIZE_MEDIUM)
+        font_graph = ImageFont.truetype(font_path, graph_font_size)
     except IOError:
         font_large = ImageFont.load_default()
         font_medium = ImageFont.load_default()
+        font_graph = ImageFont.load_default()
 
     bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
     map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
@@ -1230,7 +1242,7 @@ def generate_gpx_video(
         graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
     graph_layers = prepare_graph_layers(
         resolution,
-        font_medium,
+        font_graph,
         text_c,
         graph_current_point_c,
         graph_specs,
@@ -1466,12 +1478,15 @@ def render_first_frame_image(
     MAX_LARGE_DIM = 4096
     VERTICAL_BIAS = 0.65
 
+    graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
     try:
         font_large = ImageFont.truetype(font_path, FONT_SIZE_LARGE)
         font_medium = ImageFont.truetype(font_path, FONT_SIZE_MEDIUM)
+        font_graph = ImageFont.truetype(font_path, graph_font_size)
     except IOError:
         font_large = ImageFont.load_default()
         font_medium = ImageFont.load_default()
+        font_graph = ImageFont.load_default()
 
     bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
     map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
@@ -1571,7 +1586,7 @@ def render_first_frame_image(
         graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
     graph_layers = prepare_graph_layers(
         resolution,
-        font_medium,
+        font_graph,
         text_c,
         graph_current_point_c,
         graph_specs,
