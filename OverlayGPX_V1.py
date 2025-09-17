@@ -578,43 +578,81 @@ def create_graph_background_image(
     unit: str,
     base_color,
     text_color,
-) -> Image.Image:
-    """Crée une image transparente contenant axes, graduations et courbe complète."""
+) -> tuple[Image.Image, tuple[int, int], list[tuple[int, int]]]:
+    """Crée une image transparente pour le fond du graphe en coordonnées locales.
 
-    bg_img = Image.new("RGBA", resolution, (0, 0, 0, 0))
+    La taille de l'image retournée correspond uniquement à la zone du graphe,
+    complétée par les marges nécessaires pour les textes. La fonction retourne
+    également le décalage (marges gauche/haute) et la liste des points du tracé
+    exprimés dans ce repère local.
+    """
+
     if not is_area_visible(draw_area):
-        return bg_img
+        empty = Image.new("RGBA", (1, 1), (0, 0, 0, 0))
+        return empty, (0, 0), []
 
-    draw = ImageDraw.Draw(bg_img)
-
-    x0 = int(draw_area.get("x", 0))
-    y0 = int(draw_area.get("y", 0))
     width = int(draw_area.get("width", 0))
     height = int(draw_area.get("height", 0))
+    area_x = int(draw_area.get("x", 0))
+    area_y = int(draw_area.get("y", 0))
+
+    def _measure_text(text: str) -> tuple[int, int]:
+        if hasattr(font, "getbbox"):
+            bbox = font.getbbox(text)
+            return int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])
+        return font.getsize(text)
 
     nb_ticks = 4
+    tick_infos: list[tuple[float, str, int, int]] = []
     for i in range(nb_ticks + 1):
         val = min_val + (max_val - min_val) * i / nb_ticks
-        y = y0 + int((max_val - val) / ((max_val - min_val) + 1e-10) * height)
-        draw.line([(x0, y), (x0 + width, y)], fill=(80, 80, 80), width=1)
-        val_str = f"{val:.0f}"
-        text_bbox = draw.textbbox((0, 0), val_str, font=font)
-        text_w = text_bbox[2] - text_bbox[0]
-        text_h = text_bbox[3] - text_bbox[1]
-        draw.text((x0 - text_w - 10, y - text_h / 2), val_str, font=font, fill=text_color)
+        label = f"{val:.0f}"
+        text_w, text_h = _measure_text(label)
+        tick_infos.append((val, label, text_w, text_h))
+
+    max_tick_width = max((info[2] for info in tick_infos), default=0)
+    left_margin = max_tick_width + 10 if max_tick_width > 0 else 0
+    top_margin = 0
+
+    min_label = f"Min {title}: {min_val:.0f} {unit}"
+    max_label = f"Max {title}: {max_val:.0f} {unit}"
+    min_label_w, min_label_h = _measure_text(min_label)
+    max_label_w, max_label_h = _measure_text(max_label)
+    max_label_height = max(min_label_h, max_label_h)
+    bottom_margin = max_label_height + 10 if max_label_height > 0 else 0
+
+    right_extension = max(0, max_label_w - width)
+    img_width = max(1, left_margin + width + right_extension)
+    img_height = max(1, height + bottom_margin + top_margin)
+
+    bg_img = Image.new("RGBA", (img_width, img_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(bg_img)
+
+    for val, label, text_w, text_h in tick_infos:
+        y = top_margin + int((max_val - val) / ((max_val - min_val) + 1e-10) * height)
+        draw.line([(left_margin, y), (left_margin + width, y)], fill=(80, 80, 80), width=1)
+        label_x = max(0, left_margin - text_w - 10)
+        draw.text((label_x, y - text_h / 2), label, font=font, fill=text_color)
+
+    path_coords_local: list[tuple[int, int]] = []
+    for px, py in path_coords:
+        local_x = (px - area_x) + left_margin
+        local_y = (py - area_y) + top_margin
+        path_coords_local.append((local_x, local_y))
 
     future_color = darken_color(base_color, 0.8)
-    if len(path_coords) >= 2:
-        draw.line(path_coords, fill=future_color, width=4)
-    elif len(path_coords) == 1:
-        cx, cy = path_coords[0]
+    if len(path_coords_local) >= 2:
+        draw.line(path_coords_local, fill=future_color, width=4)
+    elif len(path_coords_local) == 1:
+        cx, cy = path_coords_local[0]
         draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
 
-    text_y = y0 + height + 10
-    draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
-    draw.text((x0 + width - 200, text_y), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
+    text_y = top_margin + height + 10
+    draw.text((left_margin, text_y), min_label, font=font, fill=text_color)
+    max_text_x = left_margin + width + right_extension - max_label_w
+    draw.text((max_text_x, text_y), max_label, font=font, fill=text_color)
 
-    return bg_img
+    return bg_img, (left_margin, top_margin), path_coords_local
 
 
 def draw_graph_progress_overlay(
@@ -624,6 +662,7 @@ def draw_graph_progress_overlay(
     base_color,
     current_point_color,
     point_size: int = 4,
+    anchor: tuple[int, int] = (0, 0),
 ) -> None:
     """Dessine la portion courante et le point actuel sur un graphe pré-dessiné."""
 
@@ -631,10 +670,14 @@ def draw_graph_progress_overlay(
         return
 
     idx = max(0, min(current_index, len(path_coords) - 1))
+    ax, ay = anchor
     if idx >= 1:
-        draw.line(path_coords[: idx + 1], fill=base_color, width=5)
+        segment = [(ax + x, ay + y) for x, y in path_coords[: idx + 1]]
+        draw.line(segment, fill=base_color, width=5)
 
     cx, cy = path_coords[idx]
+    cx += ax
+    cy += ay
     draw.ellipse((cx - point_size, cy - point_size, cx + point_size, cy + point_size), fill=current_point_color)
 
 
@@ -645,13 +688,17 @@ def prepare_graph_layers(
     point_color,
     graph_specs: list[tuple[dict, list[tuple[int, int]], float, float, str, str, tuple[int, int, int]]],
 ) -> list[dict]:
-    """Prépare les couches de graphes (fond pré-rendu + méta-données)."""
+    """Prépare les couches de graphes (fond pré-rendu + méta-données).
+
+    Chaque couche contient désormais une image réduite à la zone utile du graphe
+    ainsi que l'offset de collage et les coordonnées locales du tracé.
+    """
 
     layers: list[dict] = []
     for area, path_coords, min_val, max_val, title, unit, base_color in graph_specs:
         if not is_area_visible(area):
             continue
-        background = create_graph_background_image(
+        background, (left_margin, top_margin), path_local = create_graph_background_image(
             resolution,
             path_coords,
             min_val,
@@ -663,10 +710,12 @@ def prepare_graph_layers(
             base_color,
             text_color,
         )
+        offset_x = int(area.get("x", 0)) - int(left_margin)
+        offset_y = int(area.get("y", 0)) - int(top_margin)
         layers.append(
             {
                 "area": area,
-                "path": path_coords,
+                "path": path_local,
                 "min": min_val,
                 "max": max_val,
                 "title": title,
@@ -674,6 +723,7 @@ def prepare_graph_layers(
                 "base_color": base_color,
                 "point_color": point_color,
                 "background": background,
+                "offset": (offset_x, offset_y),
                 "point_size": 4,
             }
         )
@@ -1380,7 +1430,9 @@ def generate_gpx_video(
 
             # Profils & infos
             for layer in graph_layers:
-                frame_img.paste(layer["background"], (0, 0), layer["background"])
+                bg_layer = layer["background"]
+                offset = layer.get("offset", (0, 0))
+                frame_img.paste(bg_layer, offset, bg_layer)
             for layer in graph_layers:
                 draw_graph_progress_overlay(
                     draw,
@@ -1389,6 +1441,7 @@ def generate_gpx_video(
                     layer["base_color"],
                     layer["point_color"],
                     layer["point_size"],
+                    anchor=layer.get("offset", (0, 0)),
                 )
 
             if gauge_circ_area.get("visible", False):
@@ -1702,7 +1755,9 @@ def render_first_frame_image(
         pass
 
     for layer in graph_layers:
-        frame_img.paste(layer["background"], (0, 0), layer["background"])
+        bg_layer = layer["background"]
+        offset = layer.get("offset", (0, 0))
+        frame_img.paste(bg_layer, offset, bg_layer)
     for layer in graph_layers:
         draw_graph_progress_overlay(
             draw,
@@ -1711,6 +1766,7 @@ def render_first_frame_image(
             layer["base_color"],
             layer["point_color"],
             layer["point_size"],
+            anchor=layer.get("offset", (0, 0)),
         )
 
     if gauge_circ_area.get("visible", False):
