@@ -506,6 +506,125 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
         from PIL import Image
         return Image.new("RGB", (width, height), bg_c)
 
+
+def prepare_large_map_layers(
+    mw: int,
+    mh: int,
+    patch_factor: float,
+    max_large_dim: int,
+    map_style: str,
+    zoom_level_ui: int,
+    lon_center: float,
+    lat_center: float,
+    lon_min: float,
+    lat_min: float,
+    lon_max: float,
+    lat_max: float,
+    interp_lons: np.ndarray,
+    interp_lats: np.ndarray,
+    bg_color: tuple[int, int, int],
+    path_color: tuple[int, int, int],
+    log_on_tile_error: bool,
+):
+    """Prépare le fond de carte "large" annoté avec le tracé complet et un calque progression."""
+
+    est_w = int(min(max_large_dim, mw * 6))
+    est_h = int(min(max_large_dim, mh * 6))
+    base_zoom = bbox_fit_zoom(est_w, est_h, lon_min, lat_min, lon_max, lat_max, padding_px=20)
+    zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+
+    xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+
+    x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
+    y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+    track_w = x_max - x_min; track_h = y_max - y_min
+
+    patch_w = int(math.ceil(mw * patch_factor))
+    patch_h = int(math.ceil(mh * patch_factor))
+    margin_x = patch_w // 2 + 64
+    margin_y = patch_h // 2 + 64
+    width_large = int(min(max_large_dim, max(est_w, track_w + 2 * margin_x)))
+    height_large = int(min(max_large_dim, max(est_h, track_h + 2 * margin_y)))
+
+    cx, cy = lonlat_to_pixel(lon_center, lat_center, zoom)
+    x0_world = cx - width_large / 2.0
+    y0_world = cy - height_large / 2.0
+
+    try:
+        base_map_img_large = render_base_map(
+            width_large,
+            height_large,
+            map_style,
+            zoom,
+            lon_center,
+            lat_center,
+            bg_color,
+            fail_on_tile_error=True,
+        )
+    except Exception as e:
+        if log_on_tile_error:
+            print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
+        base_map_img_large = Image.new("RGB", (width_large, height_large), bg_color)
+
+    x_full = xs_world - x0_world
+    y_full = ys_world - y0_world
+    global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+    global_xy_list = [tuple(int(coord) for coord in pt) for pt in global_xy.tolist()]
+
+    if global_xy_list:
+        draw_full = ImageDraw.Draw(base_map_img_large)
+        if len(global_xy_list) >= 2:
+            draw_full.line(global_xy_list, fill=path_color, width=3)
+        else:
+            x, y = global_xy_list[0]
+            draw_full.ellipse((x - 1, y - 1, x + 1, y + 1), fill=path_color)
+
+    progress_overlay = Image.new("RGBA", base_map_img_large.size, (0, 0, 0, 0))
+
+    return {
+        "base_map": base_map_img_large,
+        "progress_overlay": progress_overlay,
+        "global_xy": global_xy,
+        "global_xy_list": global_xy_list,
+        "x_full": x_full,
+        "y_full": y_full,
+        "patch_size": (patch_w, patch_h),
+        "zoom": zoom,
+    }
+
+
+def compute_smoothed_angles(x_full: np.ndarray, y_full: np.ndarray, speeds: np.ndarray) -> np.ndarray:
+    """Lisse les orientations successives du tracé pour un rendu fluide."""
+
+    total_frames = len(x_full)
+    if total_frames == 0:
+        return np.zeros(0, dtype=float)
+
+    dx = np.zeros(total_frames, dtype=float)
+    dy = np.zeros(total_frames, dtype=float)
+    if total_frames > 1:
+        dx[:-1] = np.diff(x_full)
+        dy[:-1] = np.diff(y_full)
+        dx[-1] = x_full[-1] - x_full[-2]
+        dy[-1] = y_full[-1] - y_full[-2]
+
+    headings = np.zeros(total_frames, dtype=float)
+    non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
+    headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
+
+    complex_raw = np.exp(1j * headings)
+    win_sizes = np.clip((15 - speeds).astype(int), 3, 15)
+    half_windows = win_sizes // 2
+    indices = np.arange(total_frames)
+    start_idx = np.maximum(indices - half_windows, 0)
+    end_idx = np.minimum(indices + half_windows + 1, total_frames)
+
+    cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
+    counts = (end_idx - start_idx).astype(float)
+    counts[counts == 0] = 1.0
+    averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
+    return np.arctan2(averages.imag, averages.real)
+
 # ---------- Graph helpers ----------
 
 def auto_speed_bounds(speeds: np.ndarray) -> tuple[float, float]:
@@ -1252,79 +1371,58 @@ def generate_gpx_video(
 
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
 
-        # Calcul du zoom de base (sur grande image), avec offset UI
-        est_w = int(min(MAX_LARGE_DIM, mw * 6))
-        est_h = int(min(MAX_LARGE_DIM, mh * 6))
-        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+        map_layers = prepare_large_map_layers(
+            mw,
+            mh,
+            PATCH_FACTOR,
+            MAX_LARGE_DIM,
+            map_style,
+            zoom_level_ui,
+            lon_c,
+            lat_c,
+            lon_min_raw,
+            lat_min_raw,
+            lon_max_raw,
+            lat_max_raw,
+            interp_lons,
+            interp_lats,
+            bg_c,
+            map_path_c,
+            log_on_tile_error=True,
+        )
 
-        # Positions "monde" au zoom choisi
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        base_map_img_large = map_layers["base_map"]
+        progress_overlay = map_layers["progress_overlay"]
+        global_xy = map_layers["global_xy"]
+        global_xy_list = map_layers["global_xy_list"]
+        x_full = map_layers["x_full"]
+        y_full = map_layers["y_full"]
+        patch_w, patch_h = map_layers["patch_size"]
 
-        # Etendue, marge et image "large"
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-        track_w = x_max - x_min; track_h = y_max - y_min
+        progress_draw = ImageDraw.Draw(progress_overlay)
+        progress_color_rgba = (*map_current_path_c, 255)
 
-        patch_w = int(math.ceil(mw * PATCH_FACTOR))
-        patch_h = int(math.ceil(mh * PATCH_FACTOR))
-        margin_x = patch_w // 2 + 64
-        margin_y = patch_h // 2 + 64
-        width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
-
-        # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
-
-        # Fond "large"
-        try:
-            base_map_img_large = render_base_map(
-                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
-            )
-        except Exception as e:
-            print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-
-        # Trace dans le repère "large"
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
-
-        # Tête lissée (pour rotation)
-        if total_frames == 0:
-            smoothed_angles = np.zeros(0, dtype=float)
-        else:
-            dx = np.zeros(total_frames, dtype=float)
-            dy = np.zeros(total_frames, dtype=float)
-            if total_frames > 1:
-                dx[:-1] = np.diff(x_full)
-                dy[:-1] = np.diff(y_full)
-                dx[-1] = x_full[-1] - x_full[-2]
-                dy[-1] = y_full[-1] - y_full[-2]
-            headings = np.zeros(total_frames, dtype=float)
-            non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
-            headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
-
-            complex_raw = np.exp(1j * headings)
-            win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-            half_windows = win_sizes // 2
-            indices = np.arange(total_frames)
-            start_idx = np.maximum(indices - half_windows, 0)
-            end_idx = np.minimum(indices + half_windows + 1, total_frames)
-
-            cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
-            counts = (end_idx - start_idx).astype(float)
-            counts[counts == 0] = 1.0
-            averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
-            smoothed_angles = np.arctan2(averages.imag, averages.real)
+        smoothed_angles = compute_smoothed_angles(x_full, y_full, interp_speeds)
 
         # Rendu images -> flux vidéo
-        last_heading_deg = math.degrees(smoothed_angles[0]) if total_frames else 0.0
+        total_points = len(global_xy_list)
+        last_heading_deg = math.degrees(smoothed_angles[0]) if smoothed_angles.size else 0.0
+        point_radius = 6
 
         for frame_idx in range(total_frames):
+            curr_pt = (
+                global_xy_list[frame_idx]
+                if frame_idx < total_points
+                else (int(global_xy[frame_idx, 0]), int(global_xy[frame_idx, 1]))
+            )
+            if frame_idx > 0:
+                prev_pt = (
+                    global_xy_list[frame_idx - 1]
+                    if frame_idx - 1 < total_points
+                    else (int(global_xy[frame_idx - 1, 0]), int(global_xy[frame_idx - 1, 1]))
+                )
+                progress_draw.line([prev_pt, curr_pt], fill=progress_color_rgba, width=4)
+
             frame_img = Image.new("RGB", resolution, bg_c)
             draw = ImageDraw.Draw(frame_img)
 
@@ -1343,17 +1441,17 @@ def generate_gpx_video(
                 dest_x = src_left - patch_left
                 dest_y = src_top  - patch_top
                 patch_img.paste(crop, (dest_x, dest_y))
+                progress_crop = progress_overlay.crop((src_left, src_top, src_right, src_bottom))
+                patch_img.paste(progress_crop, (dest_x, dest_y), progress_crop)
 
-            # Trace + progression + point (dans le patch)
+            # Point courant (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
-            np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-            np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
-            pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy_buffer[frame_idx]
-            r = 6
-            pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+            cxp = int(curr_pt[0] - patch_left)
+            cyp = int(curr_pt[1] - patch_top)
+            pdraw.ellipse(
+                (cxp - point_radius, cyp - point_radius, cxp + point_radius, cyp + point_radius),
+                fill=map_current_point_c,
+            )
 
             # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[frame_idx])
@@ -1598,64 +1696,41 @@ def render_first_frame_image(
     heading_deg = 0.0
 
     try:
-        est_w = int(min(MAX_LARGE_DIM, mw * 6))
-        est_h = int(min(MAX_LARGE_DIM, mh * 6))
-        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+        map_layers = prepare_large_map_layers(
+            mw,
+            mh,
+            PATCH_FACTOR,
+            MAX_LARGE_DIM,
+            map_style,
+            zoom_level_ui,
+            lon_c,
+            lat_c,
+            lon_min_raw,
+            lat_min_raw,
+            lon_max_raw,
+            lat_max_raw,
+            interp_lons,
+            interp_lats,
+            bg_c,
+            map_path_c,
+            log_on_tile_error=False,
+        )
 
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        base_map_img_large = map_layers["base_map"]
+        progress_overlay = map_layers["progress_overlay"]
+        global_xy = map_layers["global_xy"]
+        global_xy_list = map_layers["global_xy_list"]
+        x_full = map_layers["x_full"]
+        y_full = map_layers["y_full"]
+        patch_w, patch_h = map_layers["patch_size"]
 
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-        track_w = x_max - x_min; track_h = y_max - y_min
+        smoothed_angles = compute_smoothed_angles(x_full, y_full, interp_speeds)
 
-
-        patch_w = int(math.ceil(mw * PATCH_FACTOR))
-        patch_h = int(math.ceil(mh * PATCH_FACTOR))
-        margin_x = patch_w // 2 + 64
-        margin_y = patch_h // 2 + 64
-        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
-
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
-
-        try:
-            base_map_img_large = render_base_map(
-                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
-            )
-        except Exception:
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
-
-        headings = []
-        for i in range(total_frames):
-            if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
-            else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
-            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-                headings.append(math.atan2(dx, -dy))
-            else:
-                headings.append(0.0)
-        complex_raw = np.exp(1j * np.array(headings))
-        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-        smoothed_angles = []
-        for idx in range(total_frames):
-            w = int(win_sizes[idx])
-            half_w = w // 2
-            a = max(0, idx - half_w)
-            b = min(total_frames, idx + half_w + 1)
-            avg = np.mean(complex_raw[a:b])
-            smoothed_angles.append(math.atan2(avg.imag, avg.real))
-
+        curr_pt = (
+            global_xy_list[0]
+            if global_xy_list
+            else (int(global_xy[0, 0]), int(global_xy[0, 1]))
+        )
         xc = float(x_full[0])
         yc = float(y_full[0])
         patch_left = int(round(xc - patch_w / 2.0))
@@ -1671,19 +1746,21 @@ def render_first_frame_image(
             dest_x = src_left - patch_left
             dest_y = src_top - patch_top
             patch_img.paste(crop, (dest_x, dest_y))
+            progress_crop = progress_overlay.crop((src_left, src_top, src_right, src_bottom))
+            patch_img.paste(progress_crop, (dest_x, dest_y), progress_crop)
 
         pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[0]
-        r = 6
-        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+        point_radius = 6
+        cxp = int(curr_pt[0] - patch_left)
+        cyp = int(curr_pt[1] - patch_top)
+        pdraw.ellipse(
+            (cxp - point_radius, cyp - point_radius, cxp + point_radius, cyp + point_radius),
+            fill=map_current_point_c,
+        )
 
         speed_kmh0 = float(interp_speeds[0])
-        heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
+        heading_base = math.degrees(smoothed_angles[0]) if smoothed_angles.size else 0.0
+        heading_deg = 0.0 if speed_kmh0 < 4.0 else heading_base
         patch_img = patch_img.rotate(
             heading_deg,
             resample=Image.BICUBIC,
