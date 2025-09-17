@@ -63,7 +63,7 @@ TEXT_COLOR = (255, 255, 255)
 GAUGE_BG_COLOR = (30, 30, 30)
 
 FONT_SIZE_LARGE = 40
-FONT_SIZE_MEDIUM = 30
+FONT_SIZE_MEDIUM = 20
 MARGIN = 10
 GRAPH_PADDING = 100
 
@@ -118,7 +118,7 @@ DEFAULT_ELEMENT_CONFIGS = {
         "height": 100,
     },
     "Jauge Vitesse Circulaire": {
-        "visible": True,
+        "visible": False,
         "x": 60,
         "y": 1010,
         "width": 300,
@@ -131,7 +131,7 @@ DEFAULT_ELEMENT_CONFIGS = {
         "width": 500,
         "height": 30,
     },
-    "Jauge Vitesse Compteur": {
+    "Compteur de vitesse": {
         "visible": True,
         "x": MARGIN,
         "y": GAUGE_BASE_Y,
@@ -699,7 +699,7 @@ def draw_linear_speedometer(draw, speed, speed_min, speed_max, draw_area, font, 
     speed_text = f"{speed:.0f} km/h"
     text_bbox = draw.textbbox((0, 0), speed_text, font=font)
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
-    draw.text((x + w/2 - text_w/2, y + h/2 - text_h/2), speed_text, font=font, fill=text_color)
+    draw.text((x + w/2 - text_w/2, y - h*2 - text_h/2), speed_text, font=font, fill=text_color)
 
 def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     """
@@ -863,6 +863,20 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
 
         idx_major += 1
         v += major_step
+    # --- Affichage du texte de la vitesse courante ---
+    speed_text = f"{int(speed_clamped)}"
+    try:
+        tb = draw.textbbox((0, 0), speed_text, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    except Exception:
+        tw, th = 30, 16
+
+    # Position : centré sur le pivot, mais au-dessus
+    tx = cx - tw / 2
+    ty = cy - radius * 0.25 - th / 2  # "0.25" règle la hauteur relative
+
+    draw.text((tx, ty), speed_text, font=font, fill=text_color)
 
     # --- Aiguille + pivot ---
     ang = math.radians(value_to_angle(speed_clamped))
@@ -1160,7 +1174,7 @@ def generate_gpx_video(
     hr_area    = element_configs.get("Profil Cardio", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
     gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Jauge Vitesse Compteur", {})
+    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
     info_area  = element_configs.get("Infos Texte", {})
 
     mw = int(map_area.get("width", 0))
@@ -1506,7 +1520,7 @@ def render_first_frame_image(
     hr_area    = element_configs.get("Profil Cardio", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
     gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Jauge Vitesse Compteur", {})
+    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
     info_area  = element_configs.get("Infos Texte", {})
     compass_area = element_configs.get("Boussole (ruban)", {})
 
