@@ -64,93 +64,93 @@ GAUGE_BG_COLOR = (30, 30, 30)
 
 FONT_SIZE_LARGE = 40
 FONT_SIZE_MEDIUM = 30
-MARGIN = 50
+MARGIN = 10
 GRAPH_PADDING = 100
 
-LEFT_COLUMN_WIDTH = DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2
-RIGHT_COLUMN_X = DEFAULT_RESOLUTION[0] // 2 + MARGIN
-RIGHT_COLUMN_WIDTH = DEFAULT_RESOLUTION[0] // 2 - MARGIN * 2
-MAP_HEIGHT_DEFAULT = 460
+LEFT_COLUMN_WIDTH = 480
+RIGHT_COLUMN_X = 1500
+RIGHT_COLUMN_WIDTH = 400
+MAP_HEIGHT_DEFAULT = 480
 MAP_BOTTOM = MARGIN + MAP_HEIGHT_DEFAULT
 COMPASS_HEIGHT = 70
-COMPASS_Y = MAP_BOTTOM + 30
+COMPASS_Y = 1000
 INFO_LINES_COUNT = 6
 INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
 INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
-INFO_TEXT_Y = COMPASS_Y + COMPASS_HEIGHT + 30
-GAUGE_BASE_Y = INFO_TEXT_Y + INFO_TEXT_HEIGHT + 20
+INFO_TEXT_Y = 450
+GAUGE_BASE_Y = 900
 
 DEFAULT_ELEMENT_CONFIGS = {
     "Carte": {
         "visible": True,
         "x": MARGIN,
         "y": MARGIN,
-        "width": LEFT_COLUMN_WIDTH,
-        "height": MAP_HEIGHT_DEFAULT,
+        "width": 300,
+        "height": 300,
     },
     "Profil Altitude": {
         "visible": True,
         "x": RIGHT_COLUMN_X,
-        "y": MARGIN,
+        "y": 400,
         "width": RIGHT_COLUMN_WIDTH,
-        "height": 200,
+        "height": 130,
     },
     "Profil Vitesse": {
         "visible": True,
         "x": RIGHT_COLUMN_X,
-        "y": MARGIN + 200 + GRAPH_PADDING,
+        "y": 600,
         "width": RIGHT_COLUMN_WIDTH,
-        "height": 150,
+        "height": 100,
     },
     # --- AJOUTS : profils Allure & Cardio ---
     "Profil Allure": {
         "visible": True,
         "x": RIGHT_COLUMN_X,
-        "y": MARGIN + 200 + GRAPH_PADDING + 150 + GRAPH_PADDING,
+        "y": 750,
         "width": RIGHT_COLUMN_WIDTH,
-        "height": 150,
+        "height": 100,
     },
     "Profil Cardio": {
         "visible": True,
         "x": RIGHT_COLUMN_X,
-        "y": MARGIN + 200 + GRAPH_PADDING + 150 + GRAPH_PADDING + 150 + GRAPH_PADDING,
+        "y": 920,
         "width": RIGHT_COLUMN_WIDTH,
-        "height": 150,
+        "height": 100,
     },
     "Jauge Vitesse Circulaire": {
         "visible": True,
-        "x": MARGIN,
-        "y": GAUGE_BASE_Y,
+        "x": 60,
+        "y": 1010,
         "width": 300,
         "height": 50,
     },
     "Jauge Vitesse Linéaire": {
-        "visible": False,
-        "x": MARGIN,
-        "y": GAUGE_BASE_Y,
-        "width": 300,
+        "visible": True,
+        "x": 705,
+        "y": 936,
+        "width": 500,
         "height": 30,
     },
     "Jauge Vitesse Compteur": {
-        "visible": False,
+        "visible": True,
         "x": MARGIN,
         "y": GAUGE_BASE_Y,
-        "width": 200,
-        "height": 80,
+        "width": 400,
+        "height": 160,
     },
     "Boussole (ruban)": {
         "visible": True,
-        "x": MARGIN,
-        "y": COMPASS_Y,
-        "width": LEFT_COLUMN_WIDTH,  # aligné sous la carte
-        "height": COMPASS_HEIGHT,
+        "x": 704,
+        "y": -100,
+        "width": 513,  # largeur personnalisée du ruban
+        "height": 70,
     },
     # Augmente la hauteur pour accueillir Allure, FC et Pente
     "Infos Texte": {
         "visible": True,
         "x": MARGIN,
         "y": INFO_TEXT_Y,
-        "width": 450,
+        "width": 368,
         "height": INFO_TEXT_HEIGHT,  # 6 lignes : Vitesse, Altitude, Heure, Pente, Allure, FC
     },
 }
