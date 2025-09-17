@@ -69,6 +69,12 @@ MIN_GRAPH_FONT_SIZE = 4
 MARGIN = 10
 GRAPH_PADDING = 100
 
+# Intervalle fixe pour le graphe d'allure (min/km)
+PACE_GRAPH_MIN = 2.0
+PACE_GRAPH_MAX = 8.0
+# Durée de lissage (secondes) appliquée aux données d'allure
+PACE_SMOOTHING_SECONDS = 5.0
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -269,6 +275,35 @@ def interpolate_data(times, data, interp_times, s: float = 0):
     spline = UnivariateSpline(unique_times, unique_data, k=k_value, s=s)
     return spline(interp_times)
 
+# ---------- Lissage ----------
+
+def smooth_series(values: np.ndarray, window_size: int) -> np.ndarray:
+    """Lisse un signal 1D via moyenne glissante en ignorant les valeurs non finies."""
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or window_size <= 1:
+        return arr.copy()
+
+    if window_size > arr.size:
+        window_size = arr.size
+    if window_size > 1 and window_size % 2 == 0:
+        window_size -= 1
+    if window_size <= 1:
+        return arr.copy()
+
+    kernel = np.ones(window_size, dtype=float)
+    finite_mask = np.isfinite(arr)
+    weighted_sum = np.convolve(np.where(finite_mask, arr, 0.0), kernel, mode="same")
+    weight_counts = np.convolve(finite_mask.astype(float), kernel, mode="same")
+
+    smoothed = np.divide(
+        weighted_sum,
+        weight_counts,
+        out=np.full(arr.shape, np.nan, dtype=float),
+        where=weight_counts > 0,
+    )
+    return np.where(weight_counts > 0, smoothed, arr)
+
 # ---------- Helpers Allure/FC ----------
 
 def pace_min_per_km_from_speed_kmh(speed_kmh: float) -> float:
@@ -322,6 +357,11 @@ def prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration
         interp_slopes = np.zeros_like(interp_eles)
 
     interp_pace = np.where(interp_speeds > 0.05, 60.0 / interp_speeds, np.inf)
+    if fps > 0 and interp_pace.size > 0:
+        pace_window_frames = int(round(PACE_SMOOTHING_SECONDS * float(fps)))
+        pace_window_frames = max(1, pace_window_frames)
+        if pace_window_frames > 1:
+            interp_pace = smooth_series(interp_pace, pace_window_frames)
     if np.isfinite(hrs_raw).sum() >= 2:
         mask = np.isfinite(hrs_raw)
         interp_hrs = interpolate_data(times_seconds[mask], hrs_raw[mask], interp_times)
@@ -1216,10 +1256,18 @@ def generate_gpx_video(
 
     # --- AJOUT : profils Allure & Cardio ---
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
@@ -1436,7 +1484,7 @@ def generate_gpx_video(
                                start_time + timedelta(seconds=float(interp_times[frame_idx])),
                                info_area, font_medium, tz, text_c)
                 # --- Texte Allure & FC supplémentaires ---
-                pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
+                pace_now = float(interp_pace[frame_idx])
                 hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
@@ -1561,10 +1609,18 @@ def render_first_frame_image(
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
     speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
@@ -1755,7 +1811,7 @@ def render_first_frame_image(
                        float(interp_slopes[0]),
                        start_time + timedelta(seconds=float(interp_times[0])),
                        info_area, font_medium, tz, text_c)
-        pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[0]))
+        pace_now = float(interp_pace[0])
         hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
