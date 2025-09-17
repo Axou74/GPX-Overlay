@@ -4,17 +4,17 @@
 
 import math
 import os
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 import sys, time
 import threading
 import imageio.v2 as imageio
 
-import gpxpy
 import numpy as np
 import pytz
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-from scipy.interpolate import UnivariateSpline
-import xml.etree.ElementTree as ET  # <-- ajouté pour lire la FC dans les extensions GPX
+
+from rendering import TrackData, load_interpolated_track, parse_gpx
 
 class TileFetchError(Exception):
     """Erreur bloquante lors du téléchargement de tuiles."""
@@ -195,82 +195,6 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
 
-def haversine_np(lat1, lon1, lat2, lon2):
-    """Vectorized haversine (arrays in degrees)."""
-    R = 6371000.0
-    lat1 = np.radians(lat1)
-    lat2 = np.radians(lat2)
-    dlat = lat2 - lat1
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat / 2) ** 2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon / 2) ** 2
-    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
-
-def parse_gpx(filepath: str):
-    points = []
-    gpx_start_time = None
-    gpx_end_time = None
-    try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            gpx = gpxpy.parse(f)
-
-        points_iter = (
-            pt
-            for track in gpx.tracks
-            for segment in track.segments
-            for pt in segment.points
-        )
-        for point in points_iter:
-            if (
-                point.time
-                and point.latitude is not None
-                and point.longitude is not None
-                and point.elevation is not None
-            ):
-                hr_val = None
-                for ext in getattr(point, "extensions", []):
-                    hr_node = ext.find('.//{*}hr')
-                    if hr_node is not None and hr_node.text:
-                        hr_val = float(hr_node.text.strip())
-                        break
-                points.append(
-                    {
-                        "time": point.time,
-                        "lat": point.latitude,
-                        "lon": point.longitude,
-                        "ele": point.elevation,
-                        "hr": hr_val,
-                    }
-                )
-        if points:
-            gpx_start_time = points[0]["time"]
-            gpx_end_time = points[-1]["time"]
-    except Exception as e:
-        print(f"Erreur GPX: {e}")
-        return [], None, None
-    return points, gpx_start_time, gpx_end_time
-
-def filter_points_by_time(points, start_time_str, duration_seconds, timezone_str):
-    tz = pytz.timezone(timezone_str)
-    start_time = tz.localize(datetime.fromisoformat(start_time_str))
-    end_time = start_time + timedelta(seconds=duration_seconds)
-    filtered = [pt for pt in points if start_time <= pt["time"].astimezone(tz) <= end_time]
-    if len(filtered) < 2:
-        raise ValueError("Pas assez de points GPX pour la plage horaire spécifiée.")
-    return filtered, start_time, tz
-
-def interpolate_data(times, data, interp_times, s: float = 0):
-    unique_times, unique_indices = np.unique(times, return_index=True)
-    unique_data = data[unique_indices]
-    if len(unique_times) < 2:
-        return np.interp(interp_times, times, data)
-    k_value = min(3, len(unique_times) - 1)
-    if k_value < 1:
-        return np.full_like(interp_times, data[0] if len(data) > 0 else 0)
-    spline = UnivariateSpline(unique_times, unique_data, k=k_value, s=s)
-    return spline(interp_times)
-
-# ---------- Helpers Allure/FC ----------
-
 def pace_min_per_km_from_speed_kmh(speed_kmh: float) -> float:
     """Allure (min/km) depuis vitesse (km/h). Retourne np.inf si vitesse très faible."""
     if speed_kmh is None or speed_kmh <= 0.05:
@@ -287,61 +211,6 @@ def format_pace_mmss(pace_min_per_km: float) -> str:
         m += 1
         s = 0
     return f"{m}:{s:02d} /km"
-
-
-def prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration, fps):
-    """Pré-calcul des séries interpolées communes aux rendus."""
-    dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
-    dt = np.diff(times_seconds)
-    segment_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
-    if segment_speeds.size:
-        speeds = np.insert(segment_speeds, 0, segment_speeds[0])
-    else:
-        speeds = np.array([0.0])
-
-    total_frames = max(1, int(clip_duration * fps))
-    interp_times = np.linspace(0.0, float(clip_duration), num=total_frames, endpoint=False)
-    interp_lats = interpolate_data(times_seconds, lats, interp_times)
-    interp_lons = interpolate_data(times_seconds, lons, interp_times)
-    interp_eles = interpolate_data(times_seconds, eles, interp_times)
-    interp_speeds = np.clip(
-        interpolate_data(times_seconds, speeds, interp_times), 0.0, None
-    )
-
-    if len(interp_eles) > 1:
-        dist_interp = haversine_np(interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:])
-        elev_diff = np.diff(interp_eles)
-        seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
-        slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
-        if slopes.size >= 7:
-            kernel = np.ones(7) / 7.0
-            interp_slopes = np.convolve(slopes, kernel, mode="same")
-        else:
-            interp_slopes = slopes
-    else:
-        interp_slopes = np.zeros_like(interp_eles)
-
-    interp_pace = np.where(interp_speeds > 0.05, 60.0 / interp_speeds, np.inf)
-    if np.isfinite(hrs_raw).sum() >= 2:
-        mask = np.isfinite(hrs_raw)
-        interp_hrs = interpolate_data(times_seconds[mask], hrs_raw[mask], interp_times)
-    elif np.isfinite(hrs_raw).sum() == 1:
-        val = float(hrs_raw[np.isfinite(hrs_raw)][0])
-        interp_hrs = np.full_like(interp_times, val, dtype=float)
-    else:
-        interp_hrs = np.full_like(interp_times, np.nan, dtype=float)
-
-    return {
-        "total_frames": total_frames,
-        "interp_times": interp_times,
-        "interp_lats": interp_lats,
-        "interp_lons": interp_lons,
-        "interp_eles": interp_eles,
-        "interp_speeds": interp_speeds,
-        "interp_slopes": interp_slopes,
-        "interp_pace": interp_pace,
-        "interp_hrs": interp_hrs,
-    }
 
 
 def format_hms(seconds: int) -> str:
@@ -678,6 +547,147 @@ def prepare_graph_layers(
             }
         )
     return layers
+
+
+@dataclass
+class RenderContext:
+    map_area: dict
+    map_size: tuple[int, int]
+    map_center: tuple[float, float]
+    graph_layers: list[dict]
+    gauge_circ_area: dict
+    gauge_lin_area: dict
+    gauge_cnt_area: dict
+    compass_area: dict
+    info_area: dict
+    speed_bounds: tuple[float, float]
+
+
+def prepare_render_style(font_path: str, color_configs: dict | None):
+    graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
+    try:
+        font_large = ImageFont.truetype(font_path, FONT_SIZE_LARGE)
+        font_medium = ImageFont.truetype(font_path, FONT_SIZE_MEDIUM)
+        font_graph = ImageFont.truetype(font_path, graph_font_size)
+    except IOError:
+        font_large = ImageFont.load_default()
+        font_medium = ImageFont.load_default()
+        font_graph = ImageFont.load_default()
+
+    colors = {
+        "background": color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR,
+        "map_path": color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR,
+        "map_current_path": color_configs.get("map_current_path", CURRENT_PATH_COLOR) if color_configs else CURRENT_PATH_COLOR,
+        "map_current_point": color_configs.get("map_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR,
+        "graph_altitude": color_configs.get("graph_altitude", PATH_COLOR) if color_configs else PATH_COLOR,
+        "graph_speed": color_configs.get("graph_speed", PATH_COLOR) if color_configs else PATH_COLOR,
+        "graph_pace": color_configs.get("graph_pace", PATH_COLOR) if color_configs else PATH_COLOR,
+        "graph_hr": color_configs.get("graph_hr", PATH_COLOR) if color_configs else PATH_COLOR,
+        "graph_current_point": color_configs.get("graph_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR,
+        "text": color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR,
+        "gauge_background": color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR,
+    }
+
+    fonts = {
+        "large": font_large,
+        "medium": font_medium,
+        "graph": font_graph,
+    }
+
+    return fonts, colors
+
+
+def _safe_area(area: dict | None) -> dict:
+    if area:
+        return area
+    return {"x": 0, "y": 0, "width": 1, "height": 1, "visible": False}
+
+
+def prepare_render_context(
+    resolution: tuple[int, int],
+    element_configs: dict,
+    track: TrackData,
+    font_graph,
+    colors: dict,
+) -> RenderContext:
+    map_area = element_configs.get("Carte", {})
+    if not is_area_visible(map_area):
+        raise ValueError("Zone carte non visible ou dimensions nulles.")
+    mw = int(map_area.get("width", 0))
+    mh = int(map_area.get("height", 0))
+
+    elev_area = element_configs.get("Profil Altitude", {})
+    speed_area = element_configs.get("Profil Vitesse", {})
+    pace_area = element_configs.get("Profil Allure", {})
+    hr_area = element_configs.get("Profil Cardio", {})
+    gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
+    gauge_lin_area = element_configs.get("Jauge Vitesse Linéaire", {})
+    gauge_cnt_area = element_configs.get("Compteur de vitesse", {})
+    compass_area = element_configs.get("Boussole (ruban)", {})
+    info_area = element_configs.get("Infos Texte", {})
+
+    elev_min = float(np.min(track.interp_eles))
+    elev_max = float(np.max(track.interp_eles))
+    elev_tf = GraphTransformer(elev_min, elev_max, _safe_area(elev_area))
+    elev_path = [elev_tf.to_xy(i, val, len(track.interp_eles)) for i, val in enumerate(track.interp_eles)]
+
+    speed_min_val = float(np.min(track.interp_speeds))
+    speed_max_val = float(np.max(track.interp_speeds))
+    speed_min, speed_max = auto_speed_bounds(track.interp_speeds)
+    speed_tf = GraphTransformer(speed_min, speed_max, _safe_area(speed_area))
+    speed_path = [speed_tf.to_xy(i, val, len(track.interp_speeds)) for i, val in enumerate(track.interp_speeds)]
+
+    pace_min, pace_max = 0.0, 20.0
+    pace_tf = GraphTransformer(pace_min, pace_max, _safe_area(pace_area))
+    pace_path = [
+        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(track.interp_pace))
+        for i, val in enumerate(track.interp_pace)
+    ]
+
+    has_hr = np.isfinite(track.interp_hrs).sum() >= 1
+    if has_hr:
+        hr_vals = track.interp_hrs[np.isfinite(track.interp_hrs)]
+        hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
+    else:
+        hr_min, hr_max = 0.0, 1.0
+    hr_max = hr_max if hr_max > hr_min else (hr_min + 1.0)
+    hr_tf = GraphTransformer(hr_min, hr_max, _safe_area(hr_area))
+    hr_path = [
+        hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(track.interp_hrs))
+        for i, val in enumerate(track.interp_hrs)
+    ]
+
+    graph_specs = [
+        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", colors["graph_altitude"]),
+        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", colors["graph_speed"]),
+        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", colors["graph_pace"]),
+    ]
+    if has_hr:
+        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", colors["graph_hr"]))
+
+    graph_layers = prepare_graph_layers(
+        resolution,
+        font_graph,
+        colors["text"],
+        colors["graph_current_point"],
+        graph_specs,
+    )
+
+    lon_c = (track.lon_min_raw + track.lon_max_raw) * 0.5
+    lat_c = (track.lat_min_raw + track.lat_max_raw) * 0.5
+
+    return RenderContext(
+        map_area=map_area,
+        map_size=(mw, mh),
+        map_center=(lon_c, lat_c),
+        graph_layers=graph_layers,
+        gauge_circ_area=gauge_circ_area,
+        gauge_lin_area=gauge_lin_area,
+        gauge_cnt_area=gauge_cnt_area,
+        compass_area=compass_area,
+        info_area=info_area,
+        speed_bounds=(speed_min, speed_max),
+    )
 
 def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     x0, y0 = draw_area["x"], draw_area["y"]
@@ -1090,70 +1100,44 @@ def generate_gpx_video(
     element_configs,
     color_configs=None,
     map_style: str = "CyclOSM (FR)",
-    zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
+    zoom_level_ui: int = 8,
     progress_callback=None,
 ) -> bool:
-    # --- Config interne ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
     VERTICAL_BIAS = 0.65
 
-    # Polices & couleurs
-    graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
+    fonts, colors = prepare_render_style(font_path, color_configs or {})
+    font_medium = fonts["medium"]
+    font_graph = fonts["graph"]
+
     try:
-        font_large = ImageFont.truetype(font_path, FONT_SIZE_LARGE)
-        font_medium = ImageFont.truetype(font_path, FONT_SIZE_MEDIUM)
-        font_graph = ImageFont.truetype(font_path, graph_font_size)
-    except IOError:
-        font_large = ImageFont.load_default()
-        font_medium = ImageFont.load_default()
-        font_graph = ImageFont.load_default()
-
-    bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
-    map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
-    map_current_path_c = (color_configs.get("map_current_path", CURRENT_PATH_COLOR) if color_configs else CURRENT_PATH_COLOR)
-    map_current_point_c = (color_configs.get("map_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
-    alt_path_c = (color_configs.get("graph_altitude", PATH_COLOR) if color_configs else PATH_COLOR)
-    speed_path_c = (color_configs.get("graph_speed", PATH_COLOR) if color_configs else PATH_COLOR)
-    pace_path_c = (color_configs.get("graph_pace", PATH_COLOR) if color_configs else PATH_COLOR)
-    hr_path_c = (color_configs.get("graph_hr", PATH_COLOR) if color_configs else PATH_COLOR)
-    graph_current_point_c = (color_configs.get("graph_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
-    text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
-    gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
-    compass_area = element_configs.get("Boussole (ruban)", {})
-
-
-    # GPX
-    points, gpx_start, _ = parse_gpx(gpx_filename)
-    if not points:
-        print("Aucun point GPX.")
-        return False
-    try:
-        if gpx_start is None:
-            raise ValueError("Horodatage GPX invalide")
-        tz = "Europe/Paris"
-        start_time = gpx_start + timedelta(seconds=start_offset)
-        start_str = start_time.astimezone(pytz.timezone(tz)).replace(tzinfo=None).isoformat()
-        filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz)
+        track = load_interpolated_track(
+            gpx_filename,
+            start_offset,
+            clip_duration,
+            fps,
+        )
     except ValueError as e:
         print(f"Erreur: {e}")
         return False
 
-    times_seconds = np.array([(pt["time"] - start_time).total_seconds() for pt in filtered_points], dtype=float)
-    lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
-    lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
-    eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
+    try:
+        ui_context = prepare_render_context(
+            resolution,
+            element_configs,
+            track,
+            font_graph,
+            colors,
+        )
+    except ValueError as e:
+        print(f"Erreur: {e}")
+        return False
 
-
-
-    data = prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration, fps)
-
-    total_frames = data["total_frames"]
-
+    total_frames = track.total_frames
     print(f"Génération de {total_frames} images…")
     t0 = time.time()
-    report_every = max(1, int(fps))  # ~1 update/s
+    report_every = max(1, int(fps))
 
     def _progress(done: int):
         pct = int(done * 100 / total_frames) if total_frames else 100
@@ -1168,100 +1152,50 @@ def generate_gpx_video(
             )
             sys.stdout.flush()
 
-    interp_times = data["interp_times"]
-    interp_lats = data["interp_lats"]
-    interp_lons = data["interp_lons"]
-    interp_eles = data["interp_eles"]
-    interp_speeds = data["interp_speeds"]
-    interp_slopes = data["interp_slopes"]
-    interp_pace = data["interp_pace"]
-    interp_hrs = data["interp_hrs"]
+    interp_times = track.interp_times
+    interp_lats = track.interp_lats
+    interp_lons = track.interp_lons
+    interp_eles = track.interp_eles
+    interp_speeds = track.interp_speeds
+    interp_slopes = track.interp_slopes
+    interp_pace = track.interp_pace
+    interp_hrs = track.interp_hrs
 
+    map_area = ui_context.map_area
+    mw, mh = ui_context.map_size
+    graph_layers = ui_context.graph_layers
+    gauge_circ_area = ui_context.gauge_circ_area
+    gauge_lin_area = ui_context.gauge_lin_area
+    gauge_cnt_area = ui_context.gauge_cnt_area
+    compass_area = ui_context.compass_area
+    info_area = ui_context.info_area
+    speed_min, speed_max = ui_context.speed_bounds
 
-    # Zones UI
-    map_area = element_configs.get("Carte", {})
-    elev_area = element_configs.get("Profil Altitude", {})
-    speed_area = element_configs.get("Profil Vitesse", {})
-    pace_area  = element_configs.get("Profil Allure", {})
-    hr_area    = element_configs.get("Profil Cardio", {})
-    gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
-    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
-    info_area  = element_configs.get("Infos Texte", {})
+    lon_c, lat_c = ui_context.map_center
+    lon_min_raw = track.lon_min_raw
+    lon_max_raw = track.lon_max_raw
+    lat_min_raw = track.lat_min_raw
+    lat_max_raw = track.lat_max_raw
+    start_time = track.start_time
+    tz = track.timezone
 
-    mw = int(map_area.get("width", 0))
-    mh = int(map_area.get("height", 0))
-    if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
-        print("Zone carte non visible ou dimensions nulles.")
-        return False
-
-    # BBox brute & centre
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
-    lat_c = (lat_min_raw + lat_max_raw) * 0.5
-    lon_c = (lon_min_raw + lon_max_raw) * 0.5
-
-    # Profils (altitude & vitesse)
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
-    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
-
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
-
-    speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
-
-    # --- AJOUT : profils Allure & Cardio ---
-
-    pace_min, pace_max = 0.0, 20.0
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
-    pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
-        for i, val in enumerate(interp_pace)
-    ]
-
-
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
-    if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
-        hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
-    else:
-        hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
-
-    graph_specs = [
-        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
-        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
-        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
-    ]
-    if has_hr:
-        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
-    graph_layers = prepare_graph_layers(
-        resolution,
-        font_graph,
-        text_c,
-        graph_current_point_c,
-        graph_specs,
-    )
+    bg_c = colors["background"]
+    map_path_c = colors["map_path"]
+    map_current_path_c = colors["map_current_path"]
+    map_current_point_c = colors["map_current_point"]
+    gauge_bg_c = colors["gauge_background"]
+    text_c = colors["text"]
 
     try:
-
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
 
-        # Calcul du zoom de base (sur grande image), avec offset UI
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
         est_h = int(min(MAX_LARGE_DIM, mh * 6))
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-        # Positions "monde" au zoom choisi
         xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
-        # Etendue, marge et image "large"
         x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
         y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
         track_w = x_max - x_min; track_h = y_max - y_min
@@ -1270,30 +1204,33 @@ def generate_gpx_video(
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
         margin_x = patch_w // 2 + 64
         margin_y = patch_h // 2 + 64
-        width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
         height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
 
-        # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
         cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
         x0_world = cx - width_large / 2.0
         y0_world = cy - height_large / 2.0
 
-        # Fond "large"
         try:
             base_map_img_large = render_base_map(
-                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
+                width_large,
+                height_large,
+                map_style,
+                zoom,
+                lon_c,
+                lat_c,
+                bg_c,
+                fail_on_tile_error=True,
             )
         except Exception as e:
             print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-        # Trace dans le repère "large"
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        # Tête lissée (pour rotation)
         if total_frames == 0:
             smoothed_angles = np.zeros(0, dtype=float)
         else:
@@ -1321,30 +1258,27 @@ def generate_gpx_video(
             averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
             smoothed_angles = np.arctan2(averages.imag, averages.real)
 
-        # Rendu images -> flux vidéo
         last_heading_deg = math.degrees(smoothed_angles[0]) if total_frames else 0.0
 
         for frame_idx in range(total_frames):
             frame_img = Image.new("RGB", resolution, bg_c)
             draw = ImageDraw.Draw(frame_img)
 
-            # Patch centré sur le point courant
             xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
             patch_left = int(round(xc - patch_w / 2.0))
-            patch_top  = int(round(yc - patch_h / 2.0))
+            patch_top = int(round(yc - patch_h / 2.0))
             patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
 
-            src_left   = max(0, patch_left)
-            src_top    = max(0, patch_top)
-            src_right  = min(base_map_img_large.width,  patch_left + patch_w)
-            src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
+            src_left = max(0, patch_left)
+            src_top = max(0, patch_top)
+            src_right = min(base_map_img_large.width, patch_left + patch_w)
+            src_bottom = min(base_map_img_large.height, patch_top + patch_h)
             if src_right > src_left and src_bottom > src_top:
                 crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
                 dest_x = src_left - patch_left
-                dest_y = src_top  - patch_top
+                dest_y = src_top - patch_top
                 patch_img.paste(crop, (dest_x, dest_y))
 
-            # Trace + progression + point (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
@@ -1355,7 +1289,6 @@ def generate_gpx_video(
             r = 6
             pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
-            # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[frame_idx])
             desired_heading = math.degrees(smoothed_angles[frame_idx])
             if speed_kmh >= 4.0:
@@ -1369,16 +1302,13 @@ def generate_gpx_video(
                 center=(patch_w / 2.0, patch_h / 2.0),
             )
 
-            # Recadrage EXACT viewport
             view_left = int(round(patch_w / 2.0 - mw / 2.0))
-            view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+            view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
             view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
-            # Collage final
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
-            # Profils & infos
             for layer in graph_layers:
                 frame_img.paste(layer["background"], (0, 0), layer["background"])
             for layer in graph_layers:
@@ -1424,25 +1354,27 @@ def generate_gpx_video(
                     gauge_bg_c,
                     text_c,
                 )
-            # Boussole : cap courant
             if compass_area.get("visible", False):
                 draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
             if info_area.get("visible", False):
-                draw_info_text(draw,
-                               float(interp_speeds[frame_idx]),
-                               float(interp_eles[frame_idx]),
-                               float(interp_slopes[frame_idx]),
-                               start_time + timedelta(seconds=float(interp_times[frame_idx])),
-                               info_area, font_medium, tz, text_c)
-                # --- Texte Allure & FC supplémentaires ---
+                draw_info_text(
+                    draw,
+                    float(interp_speeds[frame_idx]),
+                    float(interp_eles[frame_idx]),
+                    float(interp_slopes[frame_idx]),
+                    start_time + timedelta(seconds=float(interp_times[frame_idx])),
+                    info_area,
+                    font_medium,
+                    tz,
+                    text_c,
+                )
                 pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
                 hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
             writer.append_data(np.array(frame_img))
             _progress(frame_idx + 1)
-
 
         writer.close()
         print("Vidéo générée avec succès!")
@@ -1453,14 +1385,6 @@ def generate_gpx_video(
         return False
 
 
-
-
-# ---------- UI Tkinter ----------
-
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, colorchooser
-
-# ---------- Aperçu "1re frame" fidèle (mêmes paramètres que la vidéo) ----------
 def render_first_frame_image(
     gpx_filename: str,
     start_offset: int,
@@ -1473,233 +1397,165 @@ def render_first_frame_image(
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
 ):
-    # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
     VERTICAL_BIAS = 0.65
 
-    graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
-    try:
-        font_large = ImageFont.truetype(font_path, FONT_SIZE_LARGE)
-        font_medium = ImageFont.truetype(font_path, FONT_SIZE_MEDIUM)
-        font_graph = ImageFont.truetype(font_path, graph_font_size)
-    except IOError:
-        font_large = ImageFont.load_default()
-        font_medium = ImageFont.load_default()
-        font_graph = ImageFont.load_default()
+    fonts, colors = prepare_render_style(font_path, color_configs or {})
+    font_medium = fonts["medium"]
+    font_graph = fonts["graph"]
 
-    bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
-    map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
-    map_current_path_c = (color_configs.get("map_current_path", CURRENT_PATH_COLOR) if color_configs else CURRENT_PATH_COLOR)
-    map_current_point_c = (color_configs.get("map_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
-    alt_path_c = (color_configs.get("graph_altitude", PATH_COLOR) if color_configs else PATH_COLOR)
-    speed_path_c = (color_configs.get("graph_speed", PATH_COLOR) if color_configs else PATH_COLOR)
-    pace_path_c = (color_configs.get("graph_pace", PATH_COLOR) if color_configs else PATH_COLOR)
-    hr_path_c = (color_configs.get("graph_hr", PATH_COLOR) if color_configs else PATH_COLOR)
-    graph_current_point_c = (color_configs.get("graph_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
-    text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
-    gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
-
-    points, gpx_start, _ = parse_gpx(gpx_filename)
-    if not points:
-        raise ValueError("Aucun point GPX.")
-    if gpx_start is None:
-        raise ValueError("Horodatage GPX invalide")
-    tz_str = "Europe/Paris"
-    start_time = gpx_start + timedelta(seconds=start_offset)
-    start_str = start_time.astimezone(pytz.timezone(tz_str)).replace(tzinfo=None).isoformat()
-    filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz_str)
-
-    times = np.array([(pt["time"] - start_time).total_seconds() for pt in filtered_points], dtype=float)
-    lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
-    lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
-    eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
-
-    data = prepare_track_arrays(times, lats, lons, eles, hrs_raw, clip_duration, fps)
-    total_frames = data["total_frames"]
-    interp_times = data["interp_times"]
-    interp_lats = data["interp_lats"]
-    interp_lons = data["interp_lons"]
-    interp_eles = data["interp_eles"]
-    interp_speeds = data["interp_speeds"]
-    interp_slopes = data["interp_slopes"]
-    interp_pace = data["interp_pace"]
-    interp_hrs = data["interp_hrs"]
-
-
-    map_area = element_configs.get("Carte", {})
-    elev_area = element_configs.get("Profil Altitude", {})
-    speed_area = element_configs.get("Profil Vitesse", {})
-    pace_area  = element_configs.get("Profil Allure", {})
-    hr_area    = element_configs.get("Profil Cardio", {})
-    gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
-    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
-    info_area  = element_configs.get("Infos Texte", {})
-    compass_area = element_configs.get("Boussole (ruban)", {})
-
-
-    mw = int(map_area.get("width", 0)); mh = int(map_area.get("height", 0))
-    if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
-        raise ValueError("Zone carte non visible ou dimensions nulles.")
-
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
-    lat_c = (lat_min_raw + lat_max_raw) * 0.5
-    lon_c = (lon_min_raw + lon_max_raw) * 0.5
-
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
-    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
-
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
-
-    speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
-
-    pace_min, pace_max = 0.0, 20.0
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
-    pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
-        for i, val in enumerate(interp_pace)
-    ]
-
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
-    if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
-        hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
-    else:
-        hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
-
-    graph_specs = [
-        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
-        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
-        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
-    ]
-    if has_hr:
-        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
-    graph_layers = prepare_graph_layers(
-        resolution,
-        font_graph,
-        text_c,
-        graph_current_point_c,
-        graph_specs,
+    track = load_interpolated_track(
+        gpx_filename,
+        start_offset,
+        clip_duration,
+        fps,
     )
+
+    ui_context = prepare_render_context(
+        resolution,
+        element_configs,
+        track,
+        font_graph,
+        colors,
+    )
+
+    map_area = ui_context.map_area
+    mw, mh = ui_context.map_size
+    graph_layers = ui_context.graph_layers
+    gauge_circ_area = ui_context.gauge_circ_area
+    gauge_lin_area = ui_context.gauge_lin_area
+    gauge_cnt_area = ui_context.gauge_cnt_area
+    compass_area = ui_context.compass_area
+    info_area = ui_context.info_area
+    speed_min, speed_max = ui_context.speed_bounds
+
+    lon_c, lat_c = ui_context.map_center
+    lon_min_raw = track.lon_min_raw
+    lon_max_raw = track.lon_max_raw
+    lat_min_raw = track.lat_min_raw
+    lat_max_raw = track.lat_max_raw
+    start_time = track.start_time
+    tz = track.timezone
+
+    bg_c = colors["background"]
+    map_path_c = colors["map_path"]
+    map_current_path_c = colors["map_current_path"]
+    map_current_point_c = colors["map_current_point"]
+    gauge_bg_c = colors["gauge_background"]
+    text_c = colors["text"]
 
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
-    frame_idx = 0
-    heading_deg = 0.0
+
+    est_w = int(min(MAX_LARGE_DIM, mw * 6))
+    est_h = int(min(MAX_LARGE_DIM, mh * 6))
+    base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
+    zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+
+    xs_world, ys_world = lonlat_to_pixel_np(track.interp_lons, track.interp_lats, zoom)
+    x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
+    y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+    track_w = x_max - x_min; track_h = y_max - y_min
+
+    patch_w = int(math.ceil(mw * PATCH_FACTOR))
+    patch_h = int(math.ceil(mh * PATCH_FACTOR))
+    margin_x = patch_w // 2 + 64
+    margin_y = patch_h // 2 + 64
+    width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+    height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
+
+    cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
+    x0_world = cx - width_large / 2.0
+    y0_world = cy - height_large / 2.0
 
     try:
-        est_w = int(min(MAX_LARGE_DIM, mw * 6))
-        est_h = int(min(MAX_LARGE_DIM, mh * 6))
-        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
-
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-        track_w = x_max - x_min; track_h = y_max - y_min
-
-
-        patch_w = int(math.ceil(mw * PATCH_FACTOR))
-        patch_h = int(math.ceil(mh * PATCH_FACTOR))
-        margin_x = patch_w // 2 + 64
-        margin_y = patch_h // 2 + 64
-        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
-
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
-
-        try:
-            base_map_img_large = render_base_map(
-                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
-            )
-        except Exception:
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
-
-        headings = []
-        for i in range(total_frames):
-            if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
-            else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
-            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-                headings.append(math.atan2(dx, -dy))
-            else:
-                headings.append(0.0)
-        complex_raw = np.exp(1j * np.array(headings))
-        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-        smoothed_angles = []
-        for idx in range(total_frames):
-            w = int(win_sizes[idx])
-            half_w = w // 2
-            a = max(0, idx - half_w)
-            b = min(total_frames, idx + half_w + 1)
-            avg = np.mean(complex_raw[a:b])
-            smoothed_angles.append(math.atan2(avg.imag, avg.real))
-
-        xc = float(x_full[0])
-        yc = float(y_full[0])
-        patch_left = int(round(xc - patch_w / 2.0))
-        patch_top = int(round(yc - patch_h / 2.0))
-        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
-
-        src_left = max(0, patch_left)
-        src_top = max(0, patch_top)
-        src_right = min(base_map_img_large.width, patch_left + patch_w)
-        src_bottom = min(base_map_img_large.height, patch_top + patch_h)
-        if src_right > src_left and src_bottom > src_top:
-            crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
-            dest_x = src_left - patch_left
-            dest_y = src_top - patch_top
-            patch_img.paste(crop, (dest_x, dest_y))
-
-        pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[0]
-        r = 6
-        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
-
-        speed_kmh0 = float(interp_speeds[0])
-        heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
-        patch_img = patch_img.rotate(
-            heading_deg,
-            resample=Image.BICUBIC,
-            expand=False,
-            center=(patch_w / 2.0, patch_h / 2.0),
+        base_map_img_large = render_base_map(
+            width_large,
+            height_large,
+            map_style,
+            zoom,
+            lon_c,
+            lat_c,
+            bg_c,
+            fail_on_tile_error=True,
         )
-        view_left = int(round(patch_w / 2.0 - mw / 2.0))
-        view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
-
-        frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
-
-        draw_north_arrow(frame_img, map_area, heading_deg, text_c)
-
     except Exception as e:
-        pass
+        print(f"Fond carte non dispo (aperçu), fond uni utilisé: {e}")
+        base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+
+    x_full = xs_world - x0_world
+    y_full = ys_world - y0_world
+    global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+    local_xy_buffer = np.empty_like(global_xy)
+
+    total_frames = track.total_frames
+    if total_frames == 0:
+        smoothed_angles = np.zeros(0, dtype=float)
+    else:
+        dx = np.zeros(total_frames, dtype=float)
+        dy = np.zeros(total_frames, dtype=float)
+        if total_frames > 1:
+            dx[:-1] = np.diff(x_full)
+            dy[:-1] = np.diff(y_full)
+            dx[-1] = x_full[-1] - x_full[-2]
+            dy[-1] = y_full[-1] - y_full[-2]
+        headings = np.zeros(total_frames, dtype=float)
+        non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
+        headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
+        complex_raw = np.exp(1j * headings)
+        win_sizes = np.clip((15 - track.interp_speeds).astype(int), 3, 15)
+        half_windows = win_sizes // 2
+        indices = np.arange(total_frames)
+        start_idx = np.maximum(indices - half_windows, 0)
+        end_idx = np.minimum(indices + half_windows + 1, total_frames)
+        cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
+        counts = (end_idx - start_idx).astype(float)
+        counts[counts == 0] = 1.0
+        averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
+        smoothed_angles = np.arctan2(averages.imag, averages.real)
+
+    frame_idx = 0
+    xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
+    patch_left = int(round(xc - patch_w / 2.0))
+    patch_top = int(round(yc - patch_h / 2.0))
+    patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+
+    src_left = max(0, patch_left)
+    src_top = max(0, patch_top)
+    src_right = min(base_map_img_large.width, patch_left + patch_w)
+    src_bottom = min(base_map_img_large.height, patch_top + patch_h)
+    if src_right > src_left and src_bottom > src_top:
+        crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+        dest_x = src_left - patch_left
+        dest_y = src_top - patch_top
+        patch_img.paste(crop, (dest_x, dest_y))
+
+    pdraw = ImageDraw.Draw(patch_img)
+    np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
+    np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
+    local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+    pdraw.line(local_xy_list, fill=map_path_c, width=3)
+    pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
+    cxp, cyp = local_xy_buffer[frame_idx]
+    r = 6
+    pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+
+    speed_kmh0 = float(track.interp_speeds[frame_idx])
+    heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[frame_idx])
+    patch_img = patch_img.rotate(
+        heading_deg,
+        resample=Image.BICUBIC,
+        expand=False,
+        center=(patch_w / 2.0, patch_h / 2.0),
+    )
+
+    view_left = int(round(patch_w / 2.0 - mw / 2.0))
+    view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+    view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+    frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+
+    draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
     for layer in graph_layers:
         frame_img.paste(layer["background"], (0, 0), layer["background"])
@@ -1707,7 +1563,7 @@ def render_first_frame_image(
         draw_graph_progress_overlay(
             draw,
             layer["path"],
-            0,
+            frame_idx,
             layer["base_color"],
             layer["point_color"],
             layer["point_size"],
@@ -1716,7 +1572,7 @@ def render_first_frame_image(
     if gauge_circ_area.get("visible", False):
         draw_circular_speedometer(
             draw,
-            float(interp_speeds[0]),
+            speed_kmh0,
             speed_min,
             speed_max,
             gauge_circ_area,
@@ -1727,7 +1583,7 @@ def render_first_frame_image(
     if gauge_lin_area.get("visible", False):
         draw_linear_speedometer(
             draw,
-            float(interp_speeds[0]),
+            speed_kmh0,
             speed_min,
             speed_max,
             gauge_lin_area,
@@ -1738,7 +1594,7 @@ def render_first_frame_image(
     if gauge_cnt_area.get("visible", False):
         draw_digital_speedometer(
             draw,
-            float(interp_speeds[0]),
+            speed_kmh0,
             speed_min,
             speed_max,
             gauge_cnt_area,
@@ -1749,656 +1605,24 @@ def render_first_frame_image(
     if compass_area.get("visible", False):
         draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
     if info_area.get("visible", False):
-        draw_info_text(draw,
-                       float(interp_speeds[0]),
-                       float(interp_eles[0]),
-                       float(interp_slopes[0]),
-                       start_time + timedelta(seconds=float(interp_times[0])),
-                       info_area, font_medium, tz, text_c)
-        pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[0]))
-        hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
+        draw_info_text(
+            draw,
+            speed_kmh0,
+            float(track.interp_eles[frame_idx]),
+            float(track.interp_slopes[frame_idx]),
+            start_time + timedelta(seconds=float(track.interp_times[frame_idx])),
+            info_area,
+            font_medium,
+            tz,
+            text_c,
+        )
+        pace_now = pace_min_per_km_from_speed_kmh(speed_kmh0)
+        hr_now = float(track.interp_hrs[frame_idx]) if np.isfinite(track.interp_hrs[frame_idx]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
     return frame_img
 
-class GPXVideoApp:
-    def __init__(self, master):
-        self.master = master
-        master.title("Overlay GPX")
-        master.geometry("1800x800")
-        try:
-            style = ttk.Style(); style.theme_use("clam")
-        except Exception:
-            pass
 
-        self.gpx_file_path = ""
-        self.gpx_start_time_raw = None
-        self.gpx_end_time_raw = None
-        self.start_offset_var = tk.IntVar(value=0)
-
-        self.element_visibility_vars = {}
-        self.element_pos_entries_vars = {}
-        self.element_sliders_vars = {}
-        self.element_sliders = {}
-        self.element_calculated_height_labels = {}
-        self.element_initial_ratios = {}
-
-        self.preview_image_tk = None
-        self.current_video_resolution = list(DEFAULT_RESOLUTION)
-        self._block_recursion = False
-
-        # Couleurs
-        self.color_configs = {}
-        self.color_preview_frames = {}
-        self.default_color_map = {
-            "background": BG_COLOR,
-            "map_path": PATH_COLOR,
-            "map_current_path": CURRENT_PATH_COLOR,
-            "map_current_point": CURRENT_POINT_COLOR,
-            "graph_altitude": PATH_COLOR,
-            "graph_speed": (0, 255, 0),
-            "graph_pace": (255, 165, 0),
-            "graph_hr": (255, 0, 0),
-            "graph_current_point": CURRENT_POINT_COLOR,
-            "text": TEXT_COLOR,
-            "gauge_background": GAUGE_BG_COLOR,
-        }
-        self._initialize_color_configs()
-
-        # Police d'écriture
-        self.font_path_var = tk.StringVar(value=DEFAULT_FONT_PATH)
-        self.font_size_var = tk.IntVar(value=FONT_SIZE_LARGE)
-
-        # Validation entrées
-        self.vcmd_int = (master.register(self.validate_integer_or_empty), "%P")
-        self.vcmd_res = (master.register(self.validate_resolution_format), "%P")
-
-        # Style de carte + Zoom (1..12)
-        self.map_style_var = tk.StringVar(value="CyclOSM (FR)")
-        self.map_zoom_level_var = tk.IntVar(value=8)  # 1..12
-
-        # Labels conviviaux
-        self.color_labels = {
-            "background": "Fond",
-            "map_path": "Tracé carte (futur)",
-            "map_current_path": "Tracé carte (passé)",
-            "map_current_point": "Point carte",
-            "graph_altitude": "Profil altitude",
-            "graph_speed": "Profil vitesse",
-            "graph_pace": "Profil allure",
-            "graph_hr": "Profil FC",
-            "graph_current_point": "Point profil",
-            "text": "Texte",
-            "gauge_background": "Fond jauge",
-        }
-        self.progress_message_default = "Temps restant estimé : --:--:--"
-        self.generate_btn = None
-        self.create_widgets()
-        self.populate_initial_element_ratios()
-        self.update_preview_area_size()
-        self.update_all_slider_ranges()
-        self.show_preview(initial_load=True)
-
-    def _initialize_color_configs(self):
-        for key, rgb_tuple in self.default_color_map.items():
-            self.color_configs[key] = rgb_to_hex(rgb_tuple)
-        for key, frame in self.color_preview_frames.items():
-            frame.config(background=self.color_configs.get(key, "#FFFFFF"))
-
-    def populate_initial_element_ratios(self):
-        for element_name, defaults in DEFAULT_ELEMENT_CONFIGS.items():
-            if defaults["width"] > 0:
-                if defaults["height"] >= 0:
-                    self.element_initial_ratios[element_name] = defaults["height"] / defaults["width"]
-                else:
-                    self.element_initial_ratios[element_name] = 1.0
-            elif defaults["height"] > 0:
-                self.element_initial_ratios[element_name] = float("inf")
-            else:
-                self.element_initial_ratios[element_name] = 1.0
-            if element_name in self.element_calculated_height_labels:
-                w = defaults["width"]; ratio = self.element_initial_ratios[element_name]
-                h = int(round(w * ratio)) if ratio != float("inf") else defaults["height"]
-                self.element_calculated_height_labels[element_name].set(str(h))
-
-    def validate_integer_or_empty(self, value_if_allowed):
-        if value_if_allowed == "" or value_if_allowed == "-":
-            return True
-        try:
-            int(value_if_allowed); return True
-        except ValueError:
-            return False
-
-    def validate_resolution_format(self, value_if_allowed):
-        if value_if_allowed == "":
-            return True
-        parts = value_if_allowed.split("x")
-        if len(parts) == 1:
-            return self.validate_integer_or_empty(parts[0])
-        elif len(parts) == 2:
-            ok0 = parts[0] == "" or self.validate_integer_or_empty(parts[0])
-            ok1 = parts[1] == "" or self.validate_integer_or_empty(parts[1])
-            if not (ok0 and ok1): return False
-            if parts[0] != "" and parts[1] != "":
-                try:
-                    w = int(parts[0]); h = int(parts[1]); return w >= 0 and h >= 0
-                except ValueError:
-                    return False
-            return True
-        else:
-            return False
-
-    # ----- UI -----
-    def create_widgets(self):
-        main_frame = ttk.Frame(self.master)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
-
-        # Barre d’outils
-        toolbar = ttk.Frame(main_frame); toolbar.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(toolbar, text="Ouvrir GPX", command=self.select_gpx_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Prévisualiser 1ʳᵉ frame", command=self.preview_first_frame).pack(side=tk.LEFT, padx=2)
-        self.generate_btn = ttk.Button(toolbar, text="Générer Vidéo", command=self.generate_video)
-        self.generate_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
-        self.gpx_toolbar_label_var = tk.StringVar(value="GPX: aucun")
-        ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var).pack(side=tk.LEFT, padx=6)
-
-        self.progress_time_var = tk.StringVar(value=self.progress_message_default)
-        ttk.Label(toolbar, textvariable=self.progress_time_var).pack(side=tk.RIGHT, padx=6)
-
-        # Colonne gauche avec onglets pour condenser l'interface
-        config_panel_outer = ttk.Notebook(main_frame); self.config_panel_outer = config_panel_outer
-        config_panel_outer.pack(side=tk.LEFT, fill=tk.Y, expand=False, padx=(0, 10))
-
-        gen_params_tab = ttk.Frame(config_panel_outer)
-        config_panel_outer.add(gen_params_tab, text="Paramètres")
-        gen_params_frame = ttk.LabelFrame(gen_params_tab, text="Paramètres de génération")
-        gen_params_frame.pack(fill=tk.X, pady=5, anchor="n", padx=5)
-
-        gpx_frame = ttk.Frame(gen_params_frame); gpx_frame.pack(fill=tk.X, pady=5)
-        self.gpx_label = ttk.Label(gpx_frame, text="Fichier GPX: Aucun"); self.gpx_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
-
-        self.gpx_start_time_label = ttk.Label(gen_params_frame, text="Début GPX: N/A"); self.gpx_start_time_label.pack(fill=tk.X, pady=2)
-        self.gpx_end_time_label = ttk.Label(gen_params_frame, text="Fin GPX: N/A"); self.gpx_end_time_label.pack(fill=tk.X, pady=2)
-        self.gpx_duration_label = ttk.Label(gen_params_frame, text="Durée GPX: N/A")
-        self.gpx_duration_label.pack(fill=tk.X, pady=2)
-
-
-        ttk.Label(gen_params_frame, text="Début du clip:").pack(fill=tk.X, pady=2)
-        self.start_offset_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.start_offset_var, orient=tk.HORIZONTAL)
-        self.start_offset_scale.pack(fill=tk.X, pady=2)
-        self.start_offset_label = ttk.Label(gen_params_frame, text="0:00:00")
-        self.start_offset_label.pack(fill=tk.X, pady=2)
-        self.start_offset_var.trace_add("write", self.on_start_offset_change)
-        self.update_start_offset_label()
-
-        ttk.Label(gen_params_frame, text="Durée du clip:").pack(fill=tk.X, pady=2)
-        self.duration_var = tk.IntVar(value=DEFAULT_CLIP_DURATION_SECONDS)
-        self.duration_scale = ttk.Scale(gen_params_frame, from_=1, to=1, variable=self.duration_var, orient=tk.HORIZONTAL)
-        self.duration_scale.pack(fill=tk.X, pady=2)
-        self.duration_label = ttk.Label(gen_params_frame, text="0:00:00")
-        self.duration_label.pack(fill=tk.X, pady=2)
-        self.clip_time_label = ttk.Label(gen_params_frame, text="Clip: début N/A - fin N/A")
-        self.clip_time_label.pack(fill=tk.X, pady=2)
-        self.duration_var.trace_add("write", self.on_duration_slider_change)
-        self.update_duration_label()
-        self.update_clip_time_label()
-
-
-        ttk.Label(gen_params_frame, text="FPS:").pack(fill=tk.X, pady=2)
-        self.fps_entry_var = tk.StringVar(value=str(DEFAULT_FPS))
-        self.fps_entry = ttk.Entry(gen_params_frame, textvariable=self.fps_entry_var, validate="key", validatecommand=self.vcmd_int); self.fps_entry.pack(fill=tk.X, pady=2)
-
-        ttk.Label(gen_params_frame, text="Résolution Vidéo (LargeurxHauteur):").pack(fill=tk.X, pady=2)
-        self.resolution_entry_var = tk.StringVar(value=f"{DEFAULT_RESOLUTION[0]}x{DEFAULT_RESOLUTION[1]}")
-        self.resolution_entry = ttk.Entry(gen_params_frame, textvariable=self.resolution_entry_var, validate="key", validatecommand=self.vcmd_res)
-        self.resolution_entry.pack(fill=tk.X, pady=2)
-        self.resolution_entry.bind("<FocusOut>", self.on_resolution_change)
-        self.resolution_entry.bind("<Return>", self.on_resolution_change)
-
-        ttk.Label(gen_params_frame, text="Police (TTF):").pack(fill=tk.X, pady=2)
-        font_frame = ttk.Frame(gen_params_frame)
-        font_frame.pack(fill=tk.X, pady=2)
-        ttk.Entry(font_frame, textvariable=self.font_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(font_frame, text="Parcourir", command=self.select_font_file).pack(side=tk.LEFT, padx=2)
-
-        ttk.Label(gen_params_frame, text="Taille police:").pack(fill=tk.X, pady=2)
-        ttk.Entry(gen_params_frame, textvariable=self.font_size_var, validate="key", validatecommand=self.vcmd_int).pack(fill=tk.X, pady=2)
-
-        # Style de carte
-        ttk.Label(gen_params_frame, text="Style de carte:").pack(fill=tk.X, pady=2)
-        style_choices = list(MAP_TILE_SERVERS.keys())
-        self.map_style_combo = ttk.Combobox(gen_params_frame, textvariable=self.map_style_var, values=style_choices, state="readonly")
-        self.map_style_combo.pack(fill=tk.X, pady=2)
-
-        # Zoom 1..12 (combobox) — 8 = “ajusté”
-        ttk.Label(gen_params_frame, text="Zoom (1-Loin à 12-Proche) :").pack(fill=tk.X, pady=(8, 2))
-        self.zoom_combo = ttk.Combobox(gen_params_frame, textvariable=self.map_zoom_level_var, state="readonly",
-                                       values=[str(i) for i in range(1, 13)])
-        self.zoom_combo.set(str(self.map_zoom_level_var.get()))
-        self.zoom_combo.pack(fill=tk.X, pady=2)
-        # Disposition des éléments (onglet dédié)
-        elements_tab = ttk.Frame(config_panel_outer)
-        config_panel_outer.add(elements_tab, text="Disposition")
-        elements_outer_frame = ttk.LabelFrame(elements_tab, text="Disposition des éléments")
-        elements_outer_frame.pack(fill=tk.X, pady=10, anchor="n", padx=5)
-        scrollable_frame_elements = ttk.Frame(elements_outer_frame); scrollable_frame_elements.pack(fill=tk.X, expand=False)
-
-        headers = ["Élément", "Aff.", "X", "Y", "Largeur"]
-        for i, _ in enumerate(headers):
-            scrollable_frame_elements.columnconfigure(i, weight=1 if i in [0, 2, 3, 4] else 0, minsize=50 if i != 0 else 80)
-        for col, header_text in enumerate(headers):
-            ttk.Label(scrollable_frame_elements, text=header_text).grid(row=0, column=col, padx=2, pady=2, sticky="w" if col == 0 else "nsew")
-
-        row_num = 1
-        for element_name, defaults in DEFAULT_ELEMENT_CONFIGS.items():
-            ttk.Label(scrollable_frame_elements, text=element_name, wraplength=70).grid(row=row_num, column=0, padx=5, pady=2, sticky="w")
-            var = tk.BooleanVar(value=defaults["visible"])
-            cb_visible = ttk.Checkbutton(scrollable_frame_elements, variable=var, command=lambda el=element_name: self.handle_element_change(el, "visible"))
-            cb_visible.grid(row=row_num, column=1, padx=2, pady=2)
-            self.element_visibility_vars[element_name] = var
-
-            self.element_pos_entries_vars[element_name] = {}
-            self.element_sliders_vars[element_name] = {}
-            self.element_sliders[element_name] = {}
-            self.element_calculated_height_labels[element_name] = tk.StringVar()
-
-            for key_idx, key in enumerate(["x", "y", "width"]):
-                current_col = key_idx + 2
-                entry_slider_frame = ttk.Frame(scrollable_frame_elements)
-                entry_slider_frame.grid(row=row_num, column=current_col, padx=1, pady=1, sticky="ew")
-                entry_slider_frame.columnconfigure(0, weight=1)
-                entry_slider_frame.columnconfigure(1, weight=0)
-
-                entry_var = tk.StringVar(value=str(defaults[key])); self.element_pos_entries_vars[element_name][key] = entry_var
-                slider_var = tk.IntVar(value=defaults[key]); self.element_sliders_vars[element_name][key] = slider_var
-
-                entry_widget = ttk.Entry(entry_slider_frame, textvariable=entry_var, width=4, validate="key", validatecommand=self.vcmd_int)
-                entry_widget.grid(row=0, column=1, sticky="e")
-                entry_widget.bind("<FocusOut>", lambda e, el=element_name, k=key: self.handle_element_change(el, k, "entry"))
-                entry_widget.bind("<Return>",  lambda e, el=element_name, k=key: self.handle_element_change(el, k, "entry"))
-
-                slider = ttk.Scale(entry_slider_frame, variable=slider_var, orient=tk.HORIZONTAL, length=150,
-                                   command=lambda val, el=element_name, k=key: self.handle_element_change(el, k, "slider"))
-                slider.grid(row=0, column=0, sticky="ew", padx=(0, 2))
-                self.element_sliders[element_name][key] = slider
-
-            row_num += 1
-        # Onglet Couleurs
-        colors_tab = ttk.Frame(config_panel_outer)
-        config_panel_outer.add(colors_tab, text="Couleurs")
-        colors_outer = ttk.LabelFrame(colors_tab, text="Palette de couleurs")
-        colors_outer.pack(fill=tk.X, pady=10, anchor="n", padx=5)
-        self.color_preview_frames = {}
-        row = 0
-        for key, label_text in self.color_labels.items():
-            ttk.Label(colors_outer, text=label_text + " :").grid(row=row, column=0, sticky="w", padx=4, pady=4)
-            swatch = tk.Frame(colors_outer, width=28, height=18, relief="sunken", borderwidth=1,
-                              background=self.color_configs.get(key, "#FFFFFF"))
-            swatch.grid(row=row, column=1, padx=6, pady=4, sticky="w")
-            self.color_preview_frames[key] = swatch
-            def make_pick(k=key, frame=swatch):
-                return lambda: self.pick_color(k, frame)
-            ttk.Button(colors_outer, text="Modifier…", command=make_pick()).grid(row=row, column=2, padx=4, pady=4)
-            row += 1
-        btns = ttk.Frame(colors_outer)
-        btns.grid(row=row, column=0, columnspan=3, pady=(0, 4))
-        def reset_colors():
-            for k, rgb in self.default_color_map.items():
-                self.color_configs[k] = rgb_to_hex(rgb)
-                if k in self.color_preview_frames:
-                    self.color_preview_frames[k].config(background=self.color_configs[k])
-            self.show_preview(force_update=True)
-        ttk.Button(btns, text="Réinitialiser", command=reset_colors).pack(side=tk.LEFT)
-
-        # Panneau d’aperçu
-        preview_panel_frame = ttk.LabelFrame(main_frame, text="Aperçu de la disposition")
-        preview_panel_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
-        self.preview_label = ttk.Label(preview_panel_frame, text="L'aperçu apparaîtra ici.", anchor="center", relief="groove")
-        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        self.preview_label.bind("<Configure>", self.on_preview_resize)
-
-    def pick_color(self, key, preview_frame=None):
-        initial = self.color_configs.get(key, "#FFFFFF")
-        color_code = colorchooser.askcolor(color=initial, title=f"Choisir une couleur — {self.color_labels.get(key, key)}")[1]
-        if color_code:
-            self.color_configs[key] = color_code
-            if preview_frame is not None: preview_frame.config(background=color_code)
-            self.show_preview(force_update=True)
-
-    # ----- Misc UI -----
-    def on_resolution_change(self, event=None):
-        if self._block_recursion: return
-        res_text = self.resolution_entry_var.get()
-        if "x" in res_text:
-            try:
-                w_str, h_str = res_text.split("x"); w = int(w_str); h = int(h_str)
-                if w > 0 and h > 0:
-                    self.current_video_resolution = [w, h]
-                    self.update_all_slider_ranges(); self.show_preview(force_update=True)
-            except Exception:
-                pass
-
-    def handle_element_change(self, element_name, key, source="slider"):
-        if source == "slider":
-            value = self.element_sliders_vars[element_name][key].get()
-            self.element_pos_entries_vars[element_name][key].set(str(int(value)))
-        else:
-            text = self.element_pos_entries_vars[element_name][key].get()
-            if text in ("", "-"): return
-            try: value = int(text); self.element_sliders_vars[element_name][key].set(value)
-            except ValueError: return
-
-        if key in ["x", "width"]: max_val = self.current_video_resolution[0]
-        else: max_val = self.current_video_resolution[1]
-        val = int(self.element_pos_entries_vars[element_name][key].get()); val = 0 if val < 0 else min(val, max_val)
-        if source == "slider": self.element_pos_entries_vars[element_name][key].set(str(val))
-        else: self.element_sliders_vars[element_name][key].set(val)
-
-        if key == "width" and element_name in self.element_initial_ratios:
-            ratio = self.element_initial_ratios[element_name]
-            try:
-                w_val = int(self.element_pos_entries_vars[element_name]["width"].get())
-                h_val = int(round(w_val * ratio)) if ratio != float("inf") else DEFAULT_ELEMENT_CONFIGS[element_name]["height"]
-                self.element_calculated_height_labels[element_name].set(str(h_val))
-            except Exception:
-                pass
-        self.show_preview(force_update=True)
-
-    def update_all_slider_ranges(self):
-        for element_name, sliders in self.element_sliders.items():
-            for key, slider in sliders.items():
-                if key in ["x", "width"]: slider.config(from_=0, to=self.current_video_resolution[0])
-                else: slider.config(from_=0, to=self.current_video_resolution[1])
-
-    def update_preview_area_size(self):
-        self.preview_label.update_idletasks()
-        self.preview_area_width = self.preview_label.winfo_width() or 640
-        self.preview_area_height = self.preview_label.winfo_height() or 360
-
-    def update_start_offset_max(self, *args):
-        if not (self.gpx_start_time_raw and self.gpx_end_time_raw):
-            return
-        total_sec = int((self.gpx_end_time_raw - self.gpx_start_time_raw).total_seconds())
-        try:
-
-            dur = int(self.duration_var.get())
-
-        except Exception:
-            dur = 0
-        max_start = max(0, total_sec - dur)
-        self.start_offset_scale.config(to=max_start)
-        if self.start_offset_var.get() > max_start:
-            self.start_offset_var.set(max_start)
-
-        self.update_start_offset_label()
-
-    def update_duration_max(self, *args):
-        if not (self.gpx_start_time_raw and self.gpx_end_time_raw):
-            return
-        total_sec = int((self.gpx_end_time_raw - self.gpx_start_time_raw).total_seconds())
-        start = int(self.start_offset_var.get())
-        max_dur = max(1, total_sec - start)
-        self.duration_scale.config(to=max_dur)
-        if self.duration_var.get() > max_dur:
-            self.duration_var.set(max_dur)
-        self.update_duration_label()
-
-    def update_clip_time_label(self):
-        if self.gpx_start_time_raw:
-            start_dt = self.gpx_start_time_raw + timedelta(seconds=int(self.start_offset_var.get()))
-            end_dt = start_dt + timedelta(seconds=int(self.duration_var.get()))
-            self.clip_time_label.config(
-                text=f"Clip: début {start_dt.strftime('%H:%M:%S')} - fin {end_dt.strftime('%H:%M:%S')}"
-            )
-        else:
-            self.clip_time_label.config(text="Clip: début N/A - fin N/A")
-
-    def update_start_offset_label(self, *args):
-        start = int(self.start_offset_var.get())
-        total = 0
-        if self.gpx_start_time_raw and self.gpx_end_time_raw:
-            total = int((self.gpx_end_time_raw - self.gpx_start_time_raw).total_seconds())
-        remaining = max(0, total - start)
-        self.start_offset_label.config(
-            text=f"{format_hms(start)} (reste {format_hms(remaining)})"
-        )
-
-    def update_duration_label(self, *args):
-        dur = int(self.duration_var.get())
-        self.duration_label.config(text=format_hms(dur))
-
-    def on_start_offset_change(self, *args):
-        self.update_start_offset_label()
-        self.update_duration_max()
-        self.update_clip_time_label()
-
-    def on_duration_slider_change(self, *args):
-        self.update_duration_label()
-        self.update_start_offset_max()
-        self.update_clip_time_label()
-
-    def show_preview(self, force_update: bool = False, initial_load: bool = False) -> None:
-        if not initial_load and not force_update: return
-        element_configs = {}
-        for name in DEFAULT_ELEMENT_CONFIGS.keys():
-            h_str = self.element_calculated_height_labels.get(name, tk.StringVar()).get()
-            h = int(h_str) if h_str else DEFAULT_ELEMENT_CONFIGS[name]["height"]
-            element_configs[name] = {
-                "visible": self.element_visibility_vars.get(name, tk.BooleanVar(value=DEFAULT_ELEMENT_CONFIGS[name]["visible"])).get(),
-                "x": int(self.element_pos_entries_vars.get(name, {}).get("x", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["x"])).get()),
-                "y": int(self.element_pos_entries_vars.get(name, {}).get("y", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["y"])).get()),
-                "width": int(self.element_pos_entries_vars.get(name, {}).get("width", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["width"])).get()),
-                "height": h,
-            }
-        preview_img = generate_preview_image(
-            tuple(self.current_video_resolution),
-            self.font_path_var.get() or DEFAULT_FONT_PATH,
-            element_configs,
-            self.color_configs,
-        )
-        try:
-            target_w = max(1, self.preview_area_width); target_h = max(1, self.preview_area_height)
-            if preview_img.width > target_w or preview_img.height > target_h:
-                ratio = min(target_w / preview_img.width, target_h / preview_img.height)
-                preview_img = preview_img.resize((int(preview_img.width * ratio), int(preview_img.height * ratio)), Image.LANCZOS)
-        except Exception:
-            pass
-        photo = ImageTk.PhotoImage(preview_img); self.preview_image_tk = photo
-        self.preview_label.configure(image=photo); self.preview_label.image = photo
-
-
-    def preview_first_frame(self):
-        if not self.gpx_file_path:
-            messagebox.showerror("Erreur", "Veuillez sélectionner un fichier GPX.")
-            return
-        try:
-            duration = max(1, int(self.duration_var.get()))
-            fps = max(1, int(self.fps_entry_var.get()))
-        except Exception:
-            messagebox.showerror("Erreur", "Veuillez entrer des valeurs numériques valides (durée, FPS).")
-            return
-
-        element_configs = {}
-        for name in DEFAULT_ELEMENT_CONFIGS.keys():
-            h_str = self.element_calculated_height_labels.get(name, tk.StringVar()).get()
-            h = int(h_str) if h_str else DEFAULT_ELEMENT_CONFIGS[name]["height"]
-            element_configs[name] = {
-                "visible": self.element_visibility_vars.get(name, tk.BooleanVar(value=DEFAULT_ELEMENT_CONFIGS[name]["visible"])).get(),
-                "x": int(self.element_pos_entries_vars.get(name, {}).get("x", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["x"])).get()),
-                "y": int(self.element_pos_entries_vars.get(name, {}).get("y", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["y"])).get()),
-                "width": int(self.element_pos_entries_vars.get(name, {}).get("width", tk.StringVar(value=DEFAULT_ELEMENT_CONFIGS[name]["width"])).get()),
-                "height": h,
-            }
-        res = tuple(self.current_video_resolution)
-        font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
-        font_size = max(10, int(self.font_size_var.get()))
-        global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
-        FONT_SIZE_LARGE = font_size
-        FONT_SIZE_MEDIUM = int(font_size * 0.75)
-
-        try:
-            img = render_first_frame_image(
-                gpx_filename=self.gpx_file_path,
-                start_offset=int(self.start_offset_var.get()),
-                clip_duration=duration,
-                fps=fps,
-                resolution=res,
-                font_path=font_path,
-                element_configs=element_configs,
-                color_configs=self.color_configs,
-                map_style=self.map_style_var.get(),
-                zoom_level_ui=int(self.map_zoom_level_var.get()),
-            )
-        except Exception as e:
-            messagebox.showerror("Erreur", f"Aperçu impossible: {e}")
-            return
-
-        self.update_preview_area_size()
-        target_w = max(1, self.preview_area_width)
-        target_h = max(1, self.preview_area_height)
-        try:
-            if img.width > target_w or img.height > target_h:
-                r = min(target_w / img.width, target_h / img.height)
-                img = img.resize((max(1, int(img.width * r)), max(1, int(img.height * r))), Image.LANCZOS)
-        except Exception:
-            pass
-        photo = ImageTk.PhotoImage(img)
-        self.preview_image_tk = photo
-        self.preview_label.configure(image=photo)
-        self.preview_label.image = photo
-
-    def select_font_file(self):
-        filetypes = [("Fichiers de police", "*.ttf *.otf"), ("Tous les fichiers", "*.*")]
-        filename = filedialog.askopenfilename(title="Choisir une police", filetypes=filetypes)
-        if filename:
-            self.font_path_var.set(filename)
-
-    def select_gpx_file(self):
-        filetypes = [("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")]
-        filename = filedialog.askopenfilename(title="Choisir un fichier GPX", filetypes=filetypes)
-        if filename:
-            self.gpx_file_path = filename
-            points, start, end = parse_gpx(filename)
-            if not points:
-                messagebox.showerror("Erreur", "Impossible de charger le fichier GPX."); return
-            self.gpx_start_time_raw = start; self.gpx_end_time_raw = end
-            base = os.path.basename(filename)
-            self.start_offset_var.set(0)
-
-            self.update_duration_max()
-
-            self.update_start_offset_max()
-        self.gpx_label.config(text=f"Fichier GPX: {base}"); self.gpx_toolbar_label_var.set(f"GPX: {base}")
-        tz = pytz.timezone('Europe/Paris')
-        self.gpx_start_time_label.config(text=f"Début GPX: {start.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')}" if start else "Début GPX: N/A")
-        self.gpx_end_time_label.config(text=f"Fin GPX: {end.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')}" if end else "Fin GPX: N/A")
-        if start and end:
-            total_sec = int((end - start).total_seconds())
-            from datetime import timedelta
-            self.gpx_duration_label.config(text=f"Durée GPX: {str(timedelta(seconds=total_sec))}")
-        else:
-            self.gpx_duration_label.config(text="Durée GPX: N/A")
-
-        self.update_duration_label()
-
-    def on_preview_resize(self, event) -> None:
-        self.update_preview_area_size()
-        if self.preview_image_tk: self.show_preview(force_update=True)
-
-    def generate_video(self):
-        if not self.gpx_file_path:
-            messagebox.showerror("Erreur", "Veuillez sélectionner un fichier GPX."); return
-        try:
-            duration = int(self.duration_var.get()); fps = int(self.fps_entry_var.get())
-        except ValueError:
-            messagebox.showerror("Erreur", "Veuillez entrer des valeurs numériques valides."); return
-
-        element_configs = {}
-        for name in DEFAULT_ELEMENT_CONFIGS.keys():
-            element_configs[name] = {
-                "visible": self.element_visibility_vars[name].get(),
-                "x": int(self.element_pos_entries_vars[name]["x"].get()),
-                "y": int(self.element_pos_entries_vars[name]["y"].get()),
-                "width": int(self.element_pos_entries_vars[name]["width"].get()),
-                "height": int(self.element_calculated_height_labels[name].get()) if self.element_calculated_height_labels[name].get() else DEFAULT_ELEMENT_CONFIGS[name]["height"],
-            }
-
-        resolution = tuple(self.current_video_resolution)
-        output_dir = os.path.dirname(self.gpx_file_path) or os.getcwd()
-        base_name = os.path.splitext(os.path.basename(self.gpx_file_path))[0] or "video"
-        output_file = os.path.join(output_dir, f"{base_name}.mp4")
-        if os.path.exists(output_file):
-            overwrite = messagebox.askyesno(
-                "Fichier existant",
-                f"Le fichier \"{output_file}\" existe déjà. Voulez-vous l'écraser ?",
-            )
-            if not overwrite:
-                return
-
-        self.generate_btn.config(state=tk.DISABLED)
-        self.progress_time_var.set("Temps restant estimé : calcul en cours…")
-        start_time = time.time()
-
-        def run_generation():
-            error_msg = None
-
-            def progress_cb(pct):
-                if pct > 0:
-                    elapsed = time.time() - start_time
-                    remaining = elapsed * (100 - pct) / pct
-                    label = f"Temps restant estimé : {format_hms(int(remaining))}"
-                else:
-                    label = "Temps restant estimé : calcul en cours…"
-
-                def updater():
-                    self.progress_time_var.set(label)
-                self.master.after(0, updater)
-        
-            try:
-                font_path = self.font_path_var.get() or DEFAULT_FONT_PATH
-                font_size = max(10, int(self.font_size_var.get()))
-                global FONT_SIZE_LARGE, FONT_SIZE_MEDIUM
-                FONT_SIZE_LARGE = font_size
-                FONT_SIZE_MEDIUM = int(font_size * 0.75)
-        
-                success = generate_gpx_video(
-                    self.gpx_file_path,
-                    output_file,
-                    int(self.start_offset_var.get()),
-                    duration,
-                    fps,
-                    resolution,
-                    font_path,
-                    element_configs,
-                    self.color_configs,
-                    map_style=self.map_style_var.get(),
-                    zoom_level_ui=int(self.map_zoom_level_var.get()),
-                    progress_callback=progress_cb,
-                )
-            except Exception as e:
-                success = False
-                error_msg = str(e)
-
-            def finalize():
-                self.generate_btn.config(state=tk.NORMAL)
-                self.progress_time_var.set(self.progress_message_default)
-                if success:
-                    messagebox.showinfo(
-                        "Succès",
-                        "La vidéo a été générée avec succès dans :\n"
-                        f"{output_file}",
-                    )
-                else:
-                    if error_msg:
-                        messagebox.showerror("Erreur", f"Échec génération : {error_msg}")
-                    else:
-                        messagebox.showerror("Erreur", "Une erreur est survenue lors de la génération de la vidéo.")
-        
-            self.master.after(0, finalize)
-
-
-        threading.Thread(target=run_generation, daemon=True).start()
 
 
 # ----- Main -----
