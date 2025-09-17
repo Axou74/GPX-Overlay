@@ -69,6 +69,10 @@ MIN_GRAPH_FONT_SIZE = 4
 MARGIN = 10
 GRAPH_PADDING = 100
 
+# Intervalle fixe pour le graphe d'allure (min/km)
+PACE_GRAPH_MIN = 2.0
+PACE_GRAPH_MAX = 8.0
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -1216,10 +1220,18 @@ def generate_gpx_video(
 
     # --- AJOUT : profils Allure & Cardio ---
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
@@ -1561,10 +1573,18 @@ def render_first_frame_image(
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
     speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
