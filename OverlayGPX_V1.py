@@ -75,6 +75,7 @@ PACE_GRAPH_MAX = 8.0
 # Durée de lissage (secondes) appliquée aux données d'allure
 PACE_SMOOTHING_SECONDS = 5.0
 
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
