@@ -69,6 +69,12 @@ MIN_GRAPH_FONT_SIZE = 4
 MARGIN = 10
 GRAPH_PADDING = 100
 
+# Intervalle fixe pour le graphe d'allure (min/km)
+PACE_GRAPH_MIN = 2.0
+PACE_GRAPH_MAX = 8.0
+# Durée de lissage (secondes) par défaut appliquée aux données des graphes
+DEFAULT_GRAPH_SMOOTHING_SECONDS = 20.0
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -269,6 +275,35 @@ def interpolate_data(times, data, interp_times, s: float = 0):
     spline = UnivariateSpline(unique_times, unique_data, k=k_value, s=s)
     return spline(interp_times)
 
+# ---------- Lissage ----------
+
+def smooth_series(values: np.ndarray, window_size: int) -> np.ndarray:
+    """Lisse un signal 1D via moyenne glissante en ignorant les valeurs non finies."""
+
+    arr = np.asarray(values, dtype=float)
+    if arr.size == 0 or window_size <= 1:
+        return arr.copy()
+
+    if window_size > arr.size:
+        window_size = arr.size
+    if window_size > 1 and window_size % 2 == 0:
+        window_size -= 1
+    if window_size <= 1:
+        return arr.copy()
+
+    kernel = np.ones(window_size, dtype=float)
+    finite_mask = np.isfinite(arr)
+    weighted_sum = np.convolve(np.where(finite_mask, arr, 0.0), kernel, mode="same")
+    weight_counts = np.convolve(finite_mask.astype(float), kernel, mode="same")
+
+    smoothed = np.divide(
+        weighted_sum,
+        weight_counts,
+        out=np.full(arr.shape, np.nan, dtype=float),
+        where=weight_counts > 0,
+    )
+    return np.where(weight_counts > 0, smoothed, arr)
+
 # ---------- Helpers Allure/FC ----------
 
 def pace_min_per_km_from_speed_kmh(speed_kmh: float) -> float:
@@ -289,8 +324,18 @@ def format_pace_mmss(pace_min_per_km: float) -> str:
     return f"{m}:{s:02d} /km"
 
 
-def prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration, fps):
-    """Pré-calcul des séries interpolées communes aux rendus."""
+def prepare_track_arrays(
+    times_seconds,
+    lats,
+    lons,
+    eles,
+    hrs_raw,
+    clip_duration,
+    fps,
+    smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
+):
+    """Pré-calcul des séries interpolées communes aux rendus avec lissage optionnel."""
+
     dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
     dt = np.diff(times_seconds)
     segment_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
@@ -308,28 +353,46 @@ def prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration
         interpolate_data(times_seconds, speeds, interp_times), 0.0, None
     )
 
+    smoothing_seconds = max(0.0, float(smoothing_seconds))
+    smoothing_frames = 0
+    if fps > 0 and smoothing_seconds > 0.0:
+        smoothing_frames = int(round(smoothing_seconds * float(fps)))
+        if smoothing_frames < 2:
+            smoothing_frames = 0
+
+    if smoothing_frames:
+        interp_eles = smooth_series(interp_eles, smoothing_frames)
+        interp_speeds = smooth_series(interp_speeds, smoothing_frames)
+
     if len(interp_eles) > 1:
-        dist_interp = haversine_np(interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:])
+        dist_interp = haversine_np(
+            interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
+        )
         elev_diff = np.diff(interp_eles)
         seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
-        slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
-        if slopes.size >= 7:
-            kernel = np.ones(7) / 7.0
-            interp_slopes = np.convolve(slopes, kernel, mode="same")
-        else:
-            interp_slopes = slopes
+        interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
     else:
         interp_slopes = np.zeros_like(interp_eles)
 
+    if smoothing_frames and interp_slopes.size:
+        interp_slopes = smooth_series(interp_slopes, smoothing_frames)
+
     interp_pace = np.where(interp_speeds > 0.05, 60.0 / interp_speeds, np.inf)
-    if np.isfinite(hrs_raw).sum() >= 2:
+    if smoothing_frames and interp_pace.size:
+        interp_pace = smooth_series(interp_pace, smoothing_frames)
+
+    finite_hr_count = int(np.isfinite(hrs_raw).sum())
+    if finite_hr_count >= 2:
         mask = np.isfinite(hrs_raw)
         interp_hrs = interpolate_data(times_seconds[mask], hrs_raw[mask], interp_times)
-    elif np.isfinite(hrs_raw).sum() == 1:
+    elif finite_hr_count == 1:
         val = float(hrs_raw[np.isfinite(hrs_raw)][0])
         interp_hrs = np.full_like(interp_times, val, dtype=float)
     else:
         interp_hrs = np.full_like(interp_times, np.nan, dtype=float)
+
+    if smoothing_frames and np.isfinite(interp_hrs).sum() >= 1:
+        interp_hrs = smooth_series(interp_hrs, smoothing_frames)
 
     return {
         "total_frames": total_frames,
@@ -1091,6 +1154,7 @@ def generate_gpx_video(
     color_configs=None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
+    smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
     progress_callback=None,
 ) -> bool:
     # --- Config interne ---
@@ -1147,7 +1211,16 @@ def generate_gpx_video(
 
 
 
-    data = prepare_track_arrays(times_seconds, lats, lons, eles, hrs_raw, clip_duration, fps)
+    data = prepare_track_arrays(
+        times_seconds,
+        lats,
+        lons,
+        eles,
+        hrs_raw,
+        clip_duration,
+        fps,
+        smoothing_seconds,
+    )
 
     total_frames = data["total_frames"]
 
@@ -1216,10 +1289,18 @@ def generate_gpx_video(
 
     # --- AJOUT : profils Allure & Cardio ---
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
@@ -1436,7 +1517,7 @@ def generate_gpx_video(
                                start_time + timedelta(seconds=float(interp_times[frame_idx])),
                                info_area, font_medium, tz, text_c)
                 # --- Texte Allure & FC supplémentaires ---
-                pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[frame_idx]))
+                pace_now = float(interp_pace[frame_idx])
                 hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
@@ -1472,6 +1553,7 @@ def render_first_frame_image(
     color_configs: dict | None = None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
+    smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
 ):
     # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
@@ -1516,7 +1598,16 @@ def render_first_frame_image(
     eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
     hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
 
-    data = prepare_track_arrays(times, lats, lons, eles, hrs_raw, clip_duration, fps)
+    data = prepare_track_arrays(
+        times,
+        lats,
+        lons,
+        eles,
+        hrs_raw,
+        clip_duration,
+        fps,
+        smoothing_seconds,
+    )
     total_frames = data["total_frames"]
     interp_times = data["interp_times"]
     interp_lats = data["interp_lats"]
@@ -1561,10 +1652,18 @@ def render_first_frame_image(
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
     speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
 
-    pace_min, pace_max = 0.0, 20.0
+    pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
     pace_path = [
-        pace_tf.to_xy(i, (min(val, pace_max) if np.isfinite(val) else pace_max), len(interp_pace))
+        pace_tf.to_xy(
+            i,
+            (
+                pace_max
+                if not np.isfinite(val)
+                else max(pace_min, min(float(val), pace_max))
+            ),
+            len(interp_pace),
+        )
         for i, val in enumerate(interp_pace)
     ]
 
@@ -1755,7 +1854,7 @@ def render_first_frame_image(
                        float(interp_slopes[0]),
                        start_time + timedelta(seconds=float(interp_times[0])),
                        info_area, font_medium, tz, text_c)
-        pace_now = pace_min_per_km_from_speed_kmh(float(interp_speeds[0]))
+        pace_now = float(interp_pace[0])
         hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
@@ -1808,10 +1907,14 @@ class GPXVideoApp:
         # Police d'écriture
         self.font_path_var = tk.StringVar(value=DEFAULT_FONT_PATH)
         self.font_size_var = tk.IntVar(value=FONT_SIZE_LARGE)
+        self.graph_smoothing_seconds_var = tk.StringVar(
+            value=str(int(DEFAULT_GRAPH_SMOOTHING_SECONDS))
+        )
 
         # Validation entrées
         self.vcmd_int = (master.register(self.validate_integer_or_empty), "%P")
         self.vcmd_res = (master.register(self.validate_resolution_format), "%P")
+        self.vcmd_float = (master.register(self.validate_float_or_empty), "%P")
 
         # Style de carte + Zoom (1..12)
         self.map_style_var = tk.StringVar(value="CyclOSM (FR)")
@@ -1888,6 +1991,15 @@ class GPXVideoApp:
         else:
             return False
 
+    def validate_float_or_empty(self, value_if_allowed):
+        if value_if_allowed in ("", "-", ".", "-.", ",", "-,"):
+            return True
+        try:
+            float(value_if_allowed.replace(",", "."))
+            return True
+        except ValueError:
+            return False
+
     # ----- UI -----
     def create_widgets(self):
         main_frame = ttk.Frame(self.master)
@@ -1948,6 +2060,15 @@ class GPXVideoApp:
         ttk.Label(gen_params_frame, text="FPS:").pack(fill=tk.X, pady=2)
         self.fps_entry_var = tk.StringVar(value=str(DEFAULT_FPS))
         self.fps_entry = ttk.Entry(gen_params_frame, textvariable=self.fps_entry_var, validate="key", validatecommand=self.vcmd_int); self.fps_entry.pack(fill=tk.X, pady=2)
+
+        ttk.Label(gen_params_frame, text="Lissage graphes (s):").pack(fill=tk.X, pady=2)
+        self.graph_smoothing_entry = ttk.Entry(
+            gen_params_frame,
+            textvariable=self.graph_smoothing_seconds_var,
+            validate="key",
+            validatecommand=self.vcmd_float,
+        )
+        self.graph_smoothing_entry.pack(fill=tk.X, pady=2)
 
         ttk.Label(gen_params_frame, text="Résolution Vidéo (LargeurxHauteur):").pack(fill=tk.X, pady=2)
         self.resolution_entry_var = tk.StringVar(value=f"{DEFAULT_RESOLUTION[0]}x{DEFAULT_RESOLUTION[1]}")
@@ -2065,6 +2186,18 @@ class GPXVideoApp:
             self.color_configs[key] = color_code
             if preview_frame is not None: preview_frame.config(background=color_code)
             self.show_preview(force_update=True)
+
+    def get_smoothing_seconds(self) -> float:
+        text = self.graph_smoothing_seconds_var.get().strip()
+        if not text:
+            return DEFAULT_GRAPH_SMOOTHING_SECONDS
+        try:
+            value = float(text.replace(",", "."))
+        except ValueError as exc:
+            raise ValueError("invalid smoothing") from exc
+        if value < 0:
+            raise ValueError("invalid smoothing")
+        return value
 
     # ----- Misc UI -----
     def on_resolution_change(self, event=None):
@@ -2219,6 +2352,15 @@ class GPXVideoApp:
             messagebox.showerror("Erreur", "Veuillez entrer des valeurs numériques valides (durée, FPS).")
             return
 
+        try:
+            smoothing_seconds = self.get_smoothing_seconds()
+        except ValueError:
+            messagebox.showerror(
+                "Erreur",
+                "Veuillez saisir une durée de lissage valide (secondes, valeur ≥ 0).",
+            )
+            return
+
         element_configs = {}
         for name in DEFAULT_ELEMENT_CONFIGS.keys():
             h_str = self.element_calculated_height_labels.get(name, tk.StringVar()).get()
@@ -2249,6 +2391,7 @@ class GPXVideoApp:
                 color_configs=self.color_configs,
                 map_style=self.map_style_var.get(),
                 zoom_level_ui=int(self.map_zoom_level_var.get()),
+                smoothing_seconds=smoothing_seconds,
             )
         except Exception as e:
             messagebox.showerror("Erreur", f"Aperçu impossible: {e}")
@@ -2314,6 +2457,15 @@ class GPXVideoApp:
         except ValueError:
             messagebox.showerror("Erreur", "Veuillez entrer des valeurs numériques valides."); return
 
+        try:
+            smoothing_seconds = self.get_smoothing_seconds()
+        except ValueError:
+            messagebox.showerror(
+                "Erreur",
+                "Veuillez saisir une durée de lissage valide (secondes, valeur ≥ 0).",
+            )
+            return
+
         element_configs = {}
         for name in DEFAULT_ELEMENT_CONFIGS.keys():
             element_configs[name] = {
@@ -2374,6 +2526,7 @@ class GPXVideoApp:
                     self.color_configs,
                     map_style=self.map_style_var.get(),
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
+                    smoothing_seconds=smoothing_seconds,
                     progress_callback=progress_cb,
                 )
             except Exception as e:
