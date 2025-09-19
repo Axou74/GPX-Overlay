@@ -959,12 +959,51 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
     pivot_r = max(3, int(radius * 0.04))
     draw.ellipse([cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r], fill=(255, 255, 255))
 
-def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
-    display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
+def draw_info_text(
+    draw,
+    speed,
+    altitude,
+    slope,
+    current_time,
+    draw_area,
+    font,
+    tz,
+    text_color,
+    elapsed_seconds: float | None = None,
+    total_seconds: float | None = None,
+    time_label: str = "Temps",
+    duration_label: str = "Durée",
+):
     draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + FONT_SIZE_LARGE + 10), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 2 * (FONT_SIZE_LARGE + 10)), f"Heure : {display_time}", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 3 * (FONT_SIZE_LARGE + 10)), f"Pente : {slope:.1f} %", font=font, fill=text_color)
+    draw.text(
+        (draw_area["x"], draw_area["y"] + FONT_SIZE_LARGE + 10),
+        f"Altitude : {altitude:.0f} m",
+        font=font,
+        fill=text_color,
+    )
+
+    if elapsed_seconds is None:
+        display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
+        time_line = f"Heure : {display_time}"
+    else:
+        elapsed_text = format_hms(int(max(0, round(elapsed_seconds))))
+        time_line = f"{time_label} : {elapsed_text}"
+        if total_seconds is not None:
+            total_text = format_hms(int(max(0, round(total_seconds))))
+            time_line += f" / {duration_label} : {total_text}"
+
+    draw.text(
+        (draw_area["x"], draw_area["y"] + 2 * (FONT_SIZE_LARGE + 10)),
+        time_line,
+        font=font,
+        fill=text_color,
+    )
+    draw.text(
+        (draw_area["x"], draw_area["y"] + 3 * (FONT_SIZE_LARGE + 10)),
+        f"Pente : {slope:.1f} %",
+        font=font,
+        fill=text_color,
+    )
 
 # --- AJOUT : texte allure & FC (dessiné sous les 3 lignes existantes) ---
 def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
@@ -1154,6 +1193,7 @@ def generate_gpx_video(
     color_configs=None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
+    show_full_track: bool = False,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
     progress_callback=None,
 ) -> bool:
@@ -1188,7 +1228,7 @@ def generate_gpx_video(
 
 
     # GPX
-    points, gpx_start, _ = parse_gpx(gpx_filename)
+    points, gpx_start, gpx_end = parse_gpx(gpx_filename)
     if not points:
         print("Aucun point GPX.")
         return False
@@ -1268,9 +1308,18 @@ def generate_gpx_video(
         print("Zone carte non visible ou dimensions nulles.")
         return False
 
-    # BBox brute & centre
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    # BBox brute & centre (option trace complète)
+    if show_full_track and points:
+        bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
+        bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
+    else:
+        bbox_lats = lats
+        bbox_lons = lons
+
+    lat_min_raw = float(np.min(bbox_lats))
+    lat_max_raw = float(np.max(bbox_lats))
+    lon_min_raw = float(np.min(bbox_lons))
+    lon_max_raw = float(np.max(bbox_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
@@ -1329,6 +1378,31 @@ def generate_gpx_video(
         graph_specs,
     )
 
+    if show_full_track and gpx_start is not None:
+        gpx_start_local = tz.localize(gpx_start) if gpx_start.tzinfo is None else gpx_start.astimezone(tz)
+    else:
+        gpx_start_local = None
+
+    if show_full_track and gpx_end is not None:
+        gpx_end_local = tz.localize(gpx_end) if gpx_end.tzinfo is None else gpx_end.astimezone(tz)
+    else:
+        gpx_end_local = None
+
+    if gpx_start_local is not None:
+        time_reference = gpx_start_local
+        time_label = "Temps GPX"
+        duration_label = "Durée GPX"
+        total_duration_seconds = (
+            max(0, int(round((gpx_end_local - gpx_start_local).total_seconds())))
+            if gpx_end_local is not None
+            else None
+        )
+    else:
+        time_reference = start_time
+        time_label = "Temps clip"
+        duration_label = "Durée clip"
+        total_duration_seconds = max(0, int(round(clip_duration)))
+
     try:
 
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
@@ -1340,11 +1414,12 @@ def generate_gpx_video(
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
         # Positions "monde" au zoom choisi
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        xs_world_selected, ys_world_selected = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        xs_world_bbox, ys_world_bbox = lonlat_to_pixel_np(bbox_lons, bbox_lats, zoom)
 
         # Etendue, marge et image "large"
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        x_min = float(np.min(xs_world_bbox)); x_max = float(np.max(xs_world_bbox))
+        y_min = float(np.min(ys_world_bbox)); y_max = float(np.max(ys_world_bbox))
         track_w = x_max - x_min; track_h = y_max - y_min
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
@@ -1369,10 +1444,19 @@ def generate_gpx_video(
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
         # Trace dans le repère "large"
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        x_full_selected = xs_world_selected - x0_world
+        y_full_selected = ys_world_selected - y0_world
+        global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
+
+        if show_full_track and points:
+            x_full_all = xs_world_bbox - x0_world
+            y_full_all = ys_world_bbox - y0_world
+            global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
+            full_local_xy_buffer = np.empty_like(global_xy_full)
+        else:
+            global_xy_full = None
+            full_local_xy_buffer = None
 
         # Tête lissée (pour rotation)
         if total_frames == 0:
@@ -1381,10 +1465,10 @@ def generate_gpx_video(
             dx = np.zeros(total_frames, dtype=float)
             dy = np.zeros(total_frames, dtype=float)
             if total_frames > 1:
-                dx[:-1] = np.diff(x_full)
-                dy[:-1] = np.diff(y_full)
-                dx[-1] = x_full[-1] - x_full[-2]
-                dy[-1] = y_full[-1] - y_full[-2]
+                dx[:-1] = np.diff(x_full_selected)
+                dy[:-1] = np.diff(y_full_selected)
+                dx[-1] = x_full_selected[-1] - x_full_selected[-2]
+                dy[-1] = y_full_selected[-1] - y_full_selected[-2]
             headings = np.zeros(total_frames, dtype=float)
             non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
             headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
@@ -1410,7 +1494,7 @@ def generate_gpx_video(
             draw = ImageDraw.Draw(frame_img)
 
             # Patch centré sur le point courant
-            xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
+            xc = float(x_full_selected[frame_idx]); yc = float(y_full_selected[frame_idx])
             patch_left = int(round(xc - patch_w / 2.0))
             patch_top  = int(round(yc - patch_h / 2.0))
             patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
@@ -1427,10 +1511,18 @@ def generate_gpx_video(
 
             # Trace + progression + point (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
+            if global_xy_full is not None and full_local_xy_buffer is not None:
+                np.subtract(global_xy_full[:, 0], patch_left, out=full_local_xy_buffer[:, 0])
+                np.subtract(global_xy_full[:, 1], patch_top, out=full_local_xy_buffer[:, 1])
+                full_local_xy_list = [(int(pt[0]), int(pt[1])) for pt in full_local_xy_buffer]
+                if len(full_local_xy_list) >= 2:
+                    pdraw.line(full_local_xy_list, fill=map_path_c, width=2)
+
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
             local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
+            if len(local_xy_list) >= 2:
+                pdraw.line(local_xy_list, fill=map_path_c, width=3)
             pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
             cxp, cyp = local_xy_buffer[frame_idx]
             r = 6
@@ -1510,12 +1602,28 @@ def generate_gpx_video(
                 draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
             if info_area.get("visible", False):
-                draw_info_text(draw,
-                               float(interp_speeds[frame_idx]),
-                               float(interp_eles[frame_idx]),
-                               float(interp_slopes[frame_idx]),
-                               start_time + timedelta(seconds=float(interp_times[frame_idx])),
-                               info_area, font_medium, tz, text_c)
+                current_dt = start_time + timedelta(seconds=float(interp_times[frame_idx]))
+                elapsed_seconds = None
+                if time_reference is not None:
+                    try:
+                        elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
+                    except Exception:
+                        elapsed_seconds = None
+                draw_info_text(
+                    draw,
+                    float(interp_speeds[frame_idx]),
+                    float(interp_eles[frame_idx]),
+                    float(interp_slopes[frame_idx]),
+                    current_dt,
+                    info_area,
+                    font_medium,
+                    tz,
+                    text_c,
+                    elapsed_seconds=elapsed_seconds,
+                    total_seconds=total_duration_seconds,
+                    time_label=time_label,
+                    duration_label=duration_label,
+                )
                 # --- Texte Allure & FC supplémentaires ---
                 pace_now = float(interp_pace[frame_idx])
                 hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
@@ -1553,6 +1661,7 @@ def render_first_frame_image(
     color_configs: dict | None = None,
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
+    show_full_track: bool = False,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
 ):
     # --- Constantes identiques à celles de generate_gpx_video ---
@@ -1582,7 +1691,7 @@ def render_first_frame_image(
     text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
     gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
 
-    points, gpx_start, _ = parse_gpx(gpx_filename)
+    points, gpx_start, gpx_end = parse_gpx(gpx_filename)
     if not points:
         raise ValueError("Aucun point GPX.")
     if gpx_start is None:
@@ -1635,8 +1744,17 @@ def render_first_frame_image(
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
         raise ValueError("Zone carte non visible ou dimensions nulles.")
 
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    if show_full_track and points:
+        bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
+        bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
+    else:
+        bbox_lats = lats
+        bbox_lons = lons
+
+    lat_min_raw = float(np.min(bbox_lats))
+    lat_max_raw = float(np.max(bbox_lats))
+    lon_min_raw = float(np.min(bbox_lons))
+    lon_max_raw = float(np.max(bbox_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
@@ -1691,6 +1809,31 @@ def render_first_frame_image(
         graph_specs,
     )
 
+    if show_full_track and gpx_start is not None:
+        gpx_start_local = tz.localize(gpx_start) if gpx_start.tzinfo is None else gpx_start.astimezone(tz)
+    else:
+        gpx_start_local = None
+
+    if show_full_track and gpx_end is not None:
+        gpx_end_local = tz.localize(gpx_end) if gpx_end.tzinfo is None else gpx_end.astimezone(tz)
+    else:
+        gpx_end_local = None
+
+    if gpx_start_local is not None:
+        time_reference = gpx_start_local
+        time_label = "Temps GPX"
+        duration_label = "Durée GPX"
+        total_duration_seconds = (
+            max(0, int(round((gpx_end_local - gpx_start_local).total_seconds())))
+            if gpx_end_local is not None
+            else None
+        )
+    else:
+        time_reference = start_time
+        time_label = "Temps clip"
+        duration_label = "Durée clip"
+        total_duration_seconds = max(0, int(round(clip_duration)))
+
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
     frame_idx = 0
@@ -1702,10 +1845,11 @@ def render_first_frame_image(
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        xs_world_selected, ys_world_selected = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        xs_world_bbox, ys_world_bbox = lonlat_to_pixel_np(bbox_lons, bbox_lats, zoom)
 
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        x_min = float(np.min(xs_world_bbox)); x_max = float(np.max(xs_world_bbox))
+        y_min = float(np.min(ys_world_bbox)); y_max = float(np.max(ys_world_bbox))
         track_w = x_max - x_min; track_h = y_max - y_min
 
 
@@ -1727,19 +1871,28 @@ def render_first_frame_image(
         except Exception:
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        x_full_selected = xs_world_selected - x0_world
+        y_full_selected = ys_world_selected - y0_world
+        global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
+
+        if show_full_track and points:
+            x_full_all = xs_world_bbox - x0_world
+            y_full_all = ys_world_bbox - y0_world
+            global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
+            full_local_xy_buffer = np.empty_like(global_xy_full)
+        else:
+            global_xy_full = None
+            full_local_xy_buffer = None
 
         headings = []
         for i in range(total_frames):
             if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
+                dx = x_full_selected[i + 1] - x_full_selected[i]
+                dy = y_full_selected[i + 1] - y_full_selected[i]
             else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
+                dx = x_full_selected[i] - x_full_selected[i - 1]
+                dy = y_full_selected[i] - y_full_selected[i - 1]
             if abs(dx) > 1e-9 or abs(dy) > 1e-9:
                 headings.append(math.atan2(dx, -dy))
             else:
@@ -1755,8 +1908,8 @@ def render_first_frame_image(
             avg = np.mean(complex_raw[a:b])
             smoothed_angles.append(math.atan2(avg.imag, avg.real))
 
-        xc = float(x_full[0])
-        yc = float(y_full[0])
+        xc = float(x_full_selected[0])
+        yc = float(y_full_selected[0])
         patch_left = int(round(xc - patch_w / 2.0))
         patch_top = int(round(yc - patch_h / 2.0))
         patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
@@ -1772,10 +1925,17 @@ def render_first_frame_image(
             patch_img.paste(crop, (dest_x, dest_y))
 
         pdraw = ImageDraw.Draw(patch_img)
+        if global_xy_full is not None and full_local_xy_buffer is not None:
+            np.subtract(global_xy_full[:, 0], patch_left, out=full_local_xy_buffer[:, 0])
+            np.subtract(global_xy_full[:, 1], patch_top, out=full_local_xy_buffer[:, 1])
+            full_local_xy_list = [(int(pt[0]), int(pt[1])) for pt in full_local_xy_buffer]
+            if len(full_local_xy_list) >= 2:
+                pdraw.line(full_local_xy_list, fill=map_path_c, width=2)
         np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
         np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
         local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
+        if len(local_xy_list) >= 2:
+            pdraw.line(local_xy_list, fill=map_path_c, width=3)
         pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
         cxp, cyp = local_xy_buffer[0]
         r = 6
@@ -1848,12 +2008,28 @@ def render_first_frame_image(
     if compass_area.get("visible", False):
         draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
     if info_area.get("visible", False):
-        draw_info_text(draw,
-                       float(interp_speeds[0]),
-                       float(interp_eles[0]),
-                       float(interp_slopes[0]),
-                       start_time + timedelta(seconds=float(interp_times[0])),
-                       info_area, font_medium, tz, text_c)
+        current_dt = start_time + timedelta(seconds=float(interp_times[0]))
+        elapsed_seconds = None
+        if time_reference is not None:
+            try:
+                elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
+            except Exception:
+                elapsed_seconds = None
+        draw_info_text(
+            draw,
+            float(interp_speeds[0]),
+            float(interp_eles[0]),
+            float(interp_slopes[0]),
+            current_dt,
+            info_area,
+            font_medium,
+            tz,
+            text_c,
+            elapsed_seconds=elapsed_seconds,
+            total_seconds=total_duration_seconds,
+            time_label=time_label,
+            duration_label=duration_label,
+        )
         pace_now = float(interp_pace[0])
         hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
@@ -1874,6 +2050,7 @@ class GPXVideoApp:
         self.gpx_start_time_raw = None
         self.gpx_end_time_raw = None
         self.start_offset_var = tk.IntVar(value=0)
+        self.show_full_track_var = tk.BooleanVar(value=False)
 
         self.element_visibility_vars = {}
         self.element_pos_entries_vars = {}
@@ -2098,6 +2275,11 @@ class GPXVideoApp:
                                        values=[str(i) for i in range(1, 13)])
         self.zoom_combo.set(str(self.map_zoom_level_var.get()))
         self.zoom_combo.pack(fill=tk.X, pady=2)
+        ttk.Checkbutton(
+            gen_params_frame,
+            text="Trace complète sur carte (temps global)",
+            variable=self.show_full_track_var,
+        ).pack(fill=tk.X, pady=(4, 2))
         # Disposition des éléments (onglet dédié)
         elements_tab = ttk.Frame(config_panel_outer)
         config_panel_outer.add(elements_tab, text="Disposition")
@@ -2391,6 +2573,7 @@ class GPXVideoApp:
                 color_configs=self.color_configs,
                 map_style=self.map_style_var.get(),
                 zoom_level_ui=int(self.map_zoom_level_var.get()),
+                show_full_track=self.show_full_track_var.get(),
                 smoothing_seconds=smoothing_seconds,
             )
         except Exception as e:
@@ -2526,6 +2709,7 @@ class GPXVideoApp:
                     self.color_configs,
                     map_style=self.map_style_var.get(),
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
+                    show_full_track=self.show_full_track_var.get(),
                     smoothing_seconds=smoothing_seconds,
                     progress_callback=progress_cb,
                 )
