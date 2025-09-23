@@ -407,6 +407,96 @@ def prepare_track_arrays(
     }
 
 
+def to_local_time(dt: datetime, tz: pytz.BaseTzInfo) -> datetime:
+    """Ensure a datetime is timezone-aware in the provided tz."""
+
+    if dt.tzinfo is None:
+        return tz.localize(dt)
+    return dt.astimezone(tz)
+
+
+def _map_times_to_indices(track_seconds: np.ndarray, query_seconds: np.ndarray) -> np.ndarray:
+    """Associate each query time (s) to the nearest index within the track timeline."""
+
+    if track_seconds.size == 0:
+        return np.zeros(len(query_seconds), dtype=int)
+
+    insert_pos = np.searchsorted(track_seconds, query_seconds, side="left")
+    insert_pos = np.clip(insert_pos, 0, track_seconds.size)
+
+    right_idx = np.clip(insert_pos, 0, track_seconds.size - 1)
+    left_idx = np.clip(insert_pos - 1, 0, track_seconds.size - 1)
+
+    right_diff = np.abs(track_seconds[right_idx] - query_seconds)
+    left_diff = np.abs(query_seconds - track_seconds[left_idx])
+
+    use_left = left_diff <= right_diff
+    indices = np.where(use_left, left_idx, right_idx)
+    return np.maximum.accumulate(indices.astype(int))
+
+
+def build_full_track_context(
+    points: list[dict],
+    tz: pytz.BaseTzInfo,
+    clip_start_time: datetime,
+    interp_times: np.ndarray,
+):
+    """Prépare les données globales (trace complète) pour cartes et graphes."""
+
+    if not points:
+        return None
+
+    lats = np.array([pt["lat"] for pt in points], dtype=float)
+    lons = np.array([pt["lon"] for pt in points], dtype=float)
+    eles = np.array([pt["ele"] for pt in points], dtype=float)
+    hrs_raw = np.array([
+        (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in points
+    ], dtype=float)
+
+    local_times = [to_local_time(pt["time"], tz) for pt in points]
+    start_local = local_times[0]
+    end_local = local_times[-1]
+    track_seconds = np.array(
+        [(ts - start_local).total_seconds() for ts in local_times], dtype=float
+    )
+
+    if lats.size >= 2:
+        dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
+        dt = np.diff(track_seconds)
+        seg_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
+        if seg_speeds.size:
+            speeds = np.insert(seg_speeds, 0, seg_speeds[0])
+        else:
+            speeds = np.zeros(lats.shape[0], dtype=float)
+    else:
+        speeds = np.zeros(lats.shape[0], dtype=float)
+
+    pace = np.where(speeds > 0.05, 60.0 / speeds, np.inf)
+
+    clip_start_local = to_local_time(clip_start_time, tz)
+    offset_seconds = (clip_start_local - start_local).total_seconds()
+    frame_global_seconds = offset_seconds + np.asarray(interp_times, dtype=float)
+    progress_indices = _map_times_to_indices(track_seconds, frame_global_seconds)
+
+    clip_start_index = int(progress_indices[0]) if progress_indices.size else 0
+    clip_end_index = int(progress_indices[-1]) if progress_indices.size else clip_start_index
+
+    return {
+        "lats": lats,
+        "lons": lons,
+        "eles": eles,
+        "speeds": speeds,
+        "pace": pace,
+        "hrs": hrs_raw,
+        "track_seconds": track_seconds,
+        "start_local": start_local,
+        "end_local": end_local,
+        "progress_indices": progress_indices,
+        "clip_start_index": clip_start_index,
+        "clip_end_index": clip_end_index,
+    }
+
+
 def format_hms(seconds: int) -> str:
     """Format seconds into H:MM:SS."""
     return str(timedelta(seconds=int(max(0, seconds))))
@@ -687,17 +777,34 @@ def draw_graph_progress_overlay(
     base_color,
     current_point_color,
     point_size: int = 4,
+    progress_indices: np.ndarray | list[int] | None = None,
+    clip_start_index: int | None = None,
 ) -> None:
     """Dessine la portion courante et le point actuel sur un graphe pré-dessiné."""
 
     if not path_coords:
         return
 
-    idx = max(0, min(current_index, len(path_coords) - 1))
-    if idx >= 1:
-        draw.line(path_coords[: idx + 1], fill=base_color, width=5)
+    if progress_indices is not None and len(progress_indices):
+        idx_src = max(0, min(current_index, len(progress_indices) - 1))
+        idx_val = int(progress_indices[idx_src])
+        idx = max(0, min(idx_val, len(path_coords) - 1))
+        start_idx = clip_start_index if clip_start_index is not None else int(progress_indices[0])
+        start_idx = max(0, min(start_idx, len(path_coords) - 1))
 
-    cx, cy = path_coords[idx]
+        if len(path_coords) == 1:
+            cx, cy = path_coords[0]
+        else:
+            if idx >= start_idx and idx > 0:
+                seg_start = start_idx if idx >= start_idx else 0
+                draw.line(path_coords[seg_start : idx + 1], fill=base_color, width=5)
+            cx, cy = path_coords[idx]
+    else:
+        idx = max(0, min(current_index, len(path_coords) - 1))
+        if idx >= 1:
+            draw.line(path_coords[: idx + 1], fill=base_color, width=5)
+        cx, cy = path_coords[idx]
+
     draw.ellipse((cx - point_size, cy - point_size, cx + point_size, cy + point_size), fill=current_point_color)
 
 
@@ -706,12 +813,15 @@ def prepare_graph_layers(
     font,
     text_color,
     point_color,
-    graph_specs: list[tuple[dict, list[tuple[int, int]], float, float, str, str, tuple[int, int, int]]],
+    graph_specs,
 ) -> list[dict]:
     """Prépare les couches de graphes (fond pré-rendu + méta-données)."""
 
     layers: list[dict] = []
-    for area, path_coords, min_val, max_val, title, unit, base_color in graph_specs:
+    for spec in graph_specs:
+        if len(spec) < 7:
+            continue
+        area, path_coords, min_val, max_val, title, unit, base_color, *extra = spec
         if not is_area_visible(area):
             continue
         background = create_graph_background_image(
@@ -726,6 +836,12 @@ def prepare_graph_layers(
             base_color,
             text_color,
         )
+        progress_indices = None
+        clip_start_index = None
+        if extra:
+            progress_indices = extra[0]
+            if len(extra) >= 2:
+                clip_start_index = extra[1]
         layers.append(
             {
                 "area": area,
@@ -738,6 +854,8 @@ def prepare_graph_layers(
                 "point_color": point_color,
                 "background": background,
                 "point_size": 4,
+                "progress_indices": progress_indices,
+                "clip_start_index": clip_start_index,
             }
         )
     return layers
@@ -1262,6 +1380,12 @@ def generate_gpx_video(
         smoothing_seconds,
     )
 
+    full_context = (
+        build_full_track_context(points, tz, start_time, data["interp_times"])
+        if show_full_track
+        else None
+    )
+
     total_frames = data["total_frames"]
 
     print(f"Génération de {total_frames} images…")
@@ -1308,38 +1432,62 @@ def generate_gpx_video(
         print("Zone carte non visible ou dimensions nulles.")
         return False
 
-    # BBox brute & centre (option trace complète)
-    if show_full_track and points:
-        bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
-        bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
-    else:
-        bbox_lats = lats
-        bbox_lons = lons
+    full_lats = full_context["lats"] if full_context else None
+    full_lons = full_context["lons"] if full_context else None
 
-    lat_min_raw = float(np.min(bbox_lats))
-    lat_max_raw = float(np.max(bbox_lats))
-    lon_min_raw = float(np.min(bbox_lons))
-    lon_max_raw = float(np.max(bbox_lons))
+    lat_min_raw = float(np.min(lats))
+    lat_max_raw = float(np.max(lats))
+    lon_min_raw = float(np.min(lons))
+    lon_max_raw = float(np.max(lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
     # Profils (altitude & vitesse)
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
-    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
+    if full_context:
+        graph_elev_series = full_context["eles"]
+        graph_speed_series = full_context["speeds"]
+        graph_pace_series = full_context["pace"]
+        graph_hr_series = full_context["hrs"]
+        progress_indices = full_context["progress_indices"]
+        clip_start_index = full_context["clip_start_index"]
+    else:
+        graph_elev_series = interp_eles
+        graph_speed_series = interp_speeds
+        graph_pace_series = interp_pace
+        graph_hr_series = interp_hrs
+        progress_indices = None
+        clip_start_index = None
 
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
+    elev_min = float(np.min(graph_elev_series)) if graph_elev_series.size else 0.0
+    elev_max = float(np.max(graph_elev_series)) if graph_elev_series.size else 0.0
+    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
+    elev_path = [
+        elev_tf.to_xy(i, float(val), len(graph_elev_series))
+        for i, val in enumerate(graph_elev_series)
+    ]
+
+    speed_min_val = float(np.min(graph_speed_series)) if graph_speed_series.size else 0.0
+    speed_max_val = float(np.max(graph_speed_series)) if graph_speed_series.size else 0.0
+    speed_min, speed_max = (
+        auto_speed_bounds(graph_speed_series)
+        if graph_speed_series.size
+        else (0.0, 10.0)
+    )
 
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
+    speed_path = [
+        speed_tf.to_xy(i, float(val), len(graph_speed_series))
+        for i, val in enumerate(graph_speed_series)
+    ]
 
     # --- AJOUT : profils Allure & Cardio ---
 
     pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
+    pace_tf = GraphTransformer(
+        pace_min,
+        pace_max,
+        pace_area if pace_area else {"x": 0, "y": 0, "width": 1, "height": 1},
+    )
     pace_path = [
         pace_tf.to_xy(
             i,
@@ -1348,20 +1496,27 @@ def generate_gpx_video(
                 if not np.isfinite(val)
                 else max(pace_min, min(float(val), pace_max))
             ),
-            len(interp_pace),
+            len(graph_pace_series),
         )
-        for i, val in enumerate(interp_pace)
+        for i, val in enumerate(graph_pace_series)
     ]
 
-
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
+    hr_array = np.asarray(graph_hr_series, dtype=float)
+    has_hr = np.isfinite(hr_array).sum() >= 1
     if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
+        hr_vals = hr_array[np.isfinite(hr_array)]
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
+    hr_tf = GraphTransformer(
+        hr_min,
+        hr_max if hr_max > hr_min else (hr_min + 1.0),
+        hr_area if hr_area else {"x": 0, "y": 0, "width": 1, "height": 1},
+    )
+    hr_path = [
+        hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(hr_array))
+        for i, val in enumerate(hr_array)
+    ]
 
     graph_specs = [
         (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
@@ -1370,6 +1525,10 @@ def generate_gpx_video(
     ]
     if has_hr:
         graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+    if progress_indices is not None and len(progress_indices):
+        graph_specs = [
+            spec + (progress_indices, clip_start_index) for spec in graph_specs
+        ]
     graph_layers = prepare_graph_layers(
         resolution,
         font_graph,
@@ -1378,26 +1537,19 @@ def generate_gpx_video(
         graph_specs,
     )
 
-    if show_full_track and gpx_start is not None:
-        gpx_start_local = tz.localize(gpx_start) if gpx_start.tzinfo is None else gpx_start.astimezone(tz)
-    else:
-        gpx_start_local = None
-
-    if show_full_track and gpx_end is not None:
-        gpx_end_local = tz.localize(gpx_end) if gpx_end.tzinfo is None else gpx_end.astimezone(tz)
-    else:
-        gpx_end_local = None
-
-    if gpx_start_local is not None:
+    if full_context:
+        gpx_start_local = full_context["start_local"]
+        gpx_end_local = full_context["end_local"]
         time_reference = gpx_start_local
         time_label = "Temps GPX"
         duration_label = "Durée GPX"
-        total_duration_seconds = (
-            max(0, int(round((gpx_end_local - gpx_start_local).total_seconds())))
-            if gpx_end_local is not None
-            else None
+        total_duration_seconds = max(
+            0,
+            int(round((gpx_end_local - gpx_start_local).total_seconds())),
         )
     else:
+        gpx_start_local = None
+        gpx_end_local = None
         time_reference = start_time
         time_label = "Temps clip"
         duration_label = "Durée clip"
@@ -1415,12 +1567,20 @@ def generate_gpx_video(
 
         # Positions "monde" au zoom choisi
         xs_world_selected, ys_world_selected = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-        xs_world_bbox, ys_world_bbox = lonlat_to_pixel_np(bbox_lons, bbox_lats, zoom)
+        xs_world_clip, ys_world_clip = lonlat_to_pixel_np(lons, lats, zoom)
 
         # Etendue, marge et image "large"
-        x_min = float(np.min(xs_world_bbox)); x_max = float(np.max(xs_world_bbox))
-        y_min = float(np.min(ys_world_bbox)); y_max = float(np.max(ys_world_bbox))
+        x_min = float(np.min(xs_world_clip)); x_max = float(np.max(xs_world_clip))
+        y_min = float(np.min(ys_world_clip)); y_max = float(np.max(ys_world_clip))
         track_w = x_max - x_min; track_h = y_max - y_min
+
+        xs_world_full = ys_world_full = None
+        if full_lats is not None and full_lons is not None:
+            xs_world_full, ys_world_full = lonlat_to_pixel_np(full_lons, full_lats, zoom)
+            full_x_min = float(np.min(xs_world_full)); full_x_max = float(np.max(xs_world_full))
+            full_y_min = float(np.min(ys_world_full)); full_y_max = float(np.max(ys_world_full))
+            track_w = max(track_w, full_x_max - full_x_min)
+            track_h = max(track_h, full_y_max - full_y_min)
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
@@ -1449,9 +1609,9 @@ def generate_gpx_video(
         global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        if show_full_track and points:
-            x_full_all = xs_world_bbox - x0_world
-            y_full_all = ys_world_bbox - y0_world
+        if xs_world_full is not None and ys_world_full is not None:
+            x_full_all = xs_world_full - x0_world
+            y_full_all = ys_world_full - y0_world
             global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
             full_local_xy_buffer = np.empty_like(global_xy_full)
         else:
@@ -1562,6 +1722,8 @@ def generate_gpx_video(
                     layer["base_color"],
                     layer["point_color"],
                     layer["point_size"],
+                    progress_indices=layer.get("progress_indices"),
+                    clip_start_index=layer.get("clip_start_index"),
                 )
 
             if gauge_circ_area.get("visible", False):
@@ -1717,6 +1879,11 @@ def render_first_frame_image(
         fps,
         smoothing_seconds,
     )
+    full_context = (
+        build_full_track_context(points, tz, start_time, data["interp_times"])
+        if show_full_track
+        else None
+    )
     total_frames = data["total_frames"]
     interp_times = data["interp_times"]
     interp_lats = data["interp_lats"]
@@ -1744,34 +1911,59 @@ def render_first_frame_image(
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
         raise ValueError("Zone carte non visible ou dimensions nulles.")
 
-    if show_full_track and points:
-        bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
-        bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
-    else:
-        bbox_lats = lats
-        bbox_lons = lons
+    full_lats = full_context["lats"] if full_context else None
+    full_lons = full_context["lons"] if full_context else None
 
-    lat_min_raw = float(np.min(bbox_lats))
-    lat_max_raw = float(np.max(bbox_lats))
-    lon_min_raw = float(np.min(bbox_lons))
-    lon_max_raw = float(np.max(bbox_lons))
+    lat_min_raw = float(np.min(lats))
+    lat_max_raw = float(np.max(lats))
+    lon_min_raw = float(np.min(lons))
+    lon_max_raw = float(np.max(lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
-    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
+    if full_context:
+        graph_elev_series = full_context["eles"]
+        graph_speed_series = full_context["speeds"]
+        graph_pace_series = full_context["pace"]
+        graph_hr_series = full_context["hrs"]
+        progress_indices = full_context["progress_indices"]
+        clip_start_index = full_context["clip_start_index"]
+    else:
+        graph_elev_series = interp_eles
+        graph_speed_series = interp_speeds
+        graph_pace_series = interp_pace
+        graph_hr_series = interp_hrs
+        progress_indices = None
+        clip_start_index = None
 
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
+    elev_min = float(np.min(graph_elev_series)) if graph_elev_series.size else 0.0
+    elev_max = float(np.max(graph_elev_series)) if graph_elev_series.size else 0.0
+    elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
+    elev_path = [
+        elev_tf.to_xy(i, float(val), len(graph_elev_series))
+        for i, val in enumerate(graph_elev_series)
+    ]
+
+    speed_min_val = float(np.min(graph_speed_series)) if graph_speed_series.size else 0.0
+    speed_max_val = float(np.max(graph_speed_series)) if graph_speed_series.size else 0.0
+    speed_min, speed_max = (
+        auto_speed_bounds(graph_speed_series)
+        if graph_speed_series.size
+        else (0.0, 10.0)
+    )
 
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
+    speed_path = [
+        speed_tf.to_xy(i, float(val), len(graph_speed_series))
+        for i, val in enumerate(graph_speed_series)
+    ]
 
     pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
+    pace_tf = GraphTransformer(
+        pace_min,
+        pace_max,
+        pace_area if pace_area else {"x": 0, "y": 0, "width": 1, "height": 1},
+    )
     pace_path = [
         pace_tf.to_xy(
             i,
@@ -1780,19 +1972,27 @@ def render_first_frame_image(
                 if not np.isfinite(val)
                 else max(pace_min, min(float(val), pace_max))
             ),
-            len(interp_pace),
+            len(graph_pace_series),
         )
-        for i, val in enumerate(interp_pace)
+        for i, val in enumerate(graph_pace_series)
     ]
 
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
+    hr_array = np.asarray(graph_hr_series, dtype=float)
+    has_hr = np.isfinite(hr_array).sum() >= 1
     if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
+        hr_vals = hr_array[np.isfinite(hr_array)]
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
+    hr_tf = GraphTransformer(
+        hr_min,
+        hr_max if hr_max > hr_min else (hr_min + 1.0),
+        hr_area if hr_area else {"x": 0, "y": 0, "width": 1, "height": 1},
+    )
+    hr_path = [
+        hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(hr_array))
+        for i, val in enumerate(hr_array)
+    ]
 
     graph_specs = [
         (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
@@ -1801,6 +2001,10 @@ def render_first_frame_image(
     ]
     if has_hr:
         graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+    if progress_indices is not None and len(progress_indices):
+        graph_specs = [
+            spec + (progress_indices, clip_start_index) for spec in graph_specs
+        ]
     graph_layers = prepare_graph_layers(
         resolution,
         font_graph,
@@ -1809,24 +2013,15 @@ def render_first_frame_image(
         graph_specs,
     )
 
-    if show_full_track and gpx_start is not None:
-        gpx_start_local = tz.localize(gpx_start) if gpx_start.tzinfo is None else gpx_start.astimezone(tz)
-    else:
-        gpx_start_local = None
-
-    if show_full_track and gpx_end is not None:
-        gpx_end_local = tz.localize(gpx_end) if gpx_end.tzinfo is None else gpx_end.astimezone(tz)
-    else:
-        gpx_end_local = None
-
-    if gpx_start_local is not None:
+    if full_context:
+        gpx_start_local = full_context["start_local"]
+        gpx_end_local = full_context["end_local"]
         time_reference = gpx_start_local
         time_label = "Temps GPX"
         duration_label = "Durée GPX"
-        total_duration_seconds = (
-            max(0, int(round((gpx_end_local - gpx_start_local).total_seconds())))
-            if gpx_end_local is not None
-            else None
+        total_duration_seconds = max(
+            0,
+            int(round((gpx_end_local - gpx_start_local).total_seconds())),
         )
     else:
         time_reference = start_time
@@ -1846,11 +2041,19 @@ def render_first_frame_image(
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
         xs_world_selected, ys_world_selected = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-        xs_world_bbox, ys_world_bbox = lonlat_to_pixel_np(bbox_lons, bbox_lats, zoom)
+        xs_world_clip, ys_world_clip = lonlat_to_pixel_np(lons, lats, zoom)
 
-        x_min = float(np.min(xs_world_bbox)); x_max = float(np.max(xs_world_bbox))
-        y_min = float(np.min(ys_world_bbox)); y_max = float(np.max(ys_world_bbox))
+        x_min = float(np.min(xs_world_clip)); x_max = float(np.max(xs_world_clip))
+        y_min = float(np.min(ys_world_clip)); y_max = float(np.max(ys_world_clip))
         track_w = x_max - x_min; track_h = y_max - y_min
+
+        xs_world_full = ys_world_full = None
+        if full_lats is not None and full_lons is not None:
+            xs_world_full, ys_world_full = lonlat_to_pixel_np(full_lons, full_lats, zoom)
+            full_x_min = float(np.min(xs_world_full)); full_x_max = float(np.max(xs_world_full))
+            full_y_min = float(np.min(ys_world_full)); full_y_max = float(np.max(ys_world_full))
+            track_w = max(track_w, full_x_max - full_x_min)
+            track_h = max(track_h, full_y_max - full_y_min)
 
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
@@ -1876,9 +2079,9 @@ def render_first_frame_image(
         global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        if show_full_track and points:
-            x_full_all = xs_world_bbox - x0_world
-            y_full_all = ys_world_bbox - y0_world
+        if xs_world_full is not None and ys_world_full is not None:
+            x_full_all = xs_world_full - x0_world
+            y_full_all = ys_world_full - y0_world
             global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
             full_local_xy_buffer = np.empty_like(global_xy_full)
         else:
@@ -1970,6 +2173,8 @@ def render_first_frame_image(
             layer["base_color"],
             layer["point_color"],
             layer["point_size"],
+            progress_indices=layer.get("progress_indices"),
+            clip_start_index=layer.get("clip_start_index"),
         )
 
     if gauge_circ_area.get("visible", False):
