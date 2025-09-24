@@ -82,7 +82,7 @@ MAP_HEIGHT_DEFAULT = 480
 MAP_BOTTOM = MARGIN + MAP_HEIGHT_DEFAULT
 COMPASS_HEIGHT = 70
 COMPASS_Y = 1000
-INFO_LINES_COUNT = 6
+INFO_LINES_COUNT = 8
 INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
 INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
 INFO_TEXT_Y = 450
@@ -364,14 +364,18 @@ def prepare_track_arrays(
         interp_eles = smooth_series(interp_eles, smoothing_frames)
         interp_speeds = smooth_series(interp_speeds, smoothing_frames)
 
-    if len(interp_eles) > 1:
+    if len(interp_lats) > 1:
         dist_interp = haversine_np(
             interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
         )
+        interp_distances = np.zeros_like(interp_lats, dtype=float)
+        interp_distances[1:] = np.cumsum(dist_interp)
+
         elev_diff = np.diff(interp_eles)
         seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
         interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
     else:
+        interp_distances = np.zeros_like(interp_lats, dtype=float)
         interp_slopes = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
@@ -404,6 +408,65 @@ def prepare_track_arrays(
         "interp_slopes": interp_slopes,
         "interp_pace": interp_pace,
         "interp_hrs": interp_hrs,
+        "interp_distances": interp_distances,
+    }
+
+
+def build_full_track_reference(points, fps, smoothing_seconds):
+    """Construit des séries lissées pour la trace complète afin d'unifier le rendu."""
+
+    if not points:
+        return None
+
+    base_time = points[0]["time"]
+    try:
+        times_seconds = np.array(
+            [(pt["time"] - base_time).total_seconds() for pt in points], dtype=float
+        )
+    except Exception:
+        return None
+
+    lats = np.array([pt["lat"] for pt in points], dtype=float)
+    lons = np.array([pt["lon"] for pt in points], dtype=float)
+    eles = np.array([pt["ele"] for pt in points], dtype=float)
+    hrs = np.array([
+        (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in points
+    ], dtype=float)
+
+    duration = float(times_seconds[-1]) if times_seconds.size else 0.0
+    has_duration = duration > 0.0 and fps > 0
+
+    if has_duration:
+        track_data = prepare_track_arrays(
+            times_seconds,
+            lats,
+            lons,
+            eles,
+            hrs,
+            duration,
+            fps,
+            smoothing_seconds,
+        )
+        track_times = track_data["interp_times"]
+        track_lats = track_data["interp_lats"]
+        track_lons = track_data["interp_lons"]
+        track_distances = track_data["interp_distances"]
+    else:
+        track_times = times_seconds
+        track_lats = lats
+        track_lons = lons
+        track_distances = np.zeros_like(track_lats, dtype=float)
+        if track_lats.size > 1:
+            track_distances[1:] = np.cumsum(
+                haversine_np(track_lats[:-1], track_lons[:-1], track_lats[1:], track_lons[1:])
+            )
+
+    return {
+        "times": track_times,
+        "lats": track_lats,
+        "lons": track_lons,
+        "distances": track_distances,
+        "duration": duration,
     }
 
 
@@ -973,41 +1036,52 @@ def draw_info_text(
     total_seconds: float | None = None,
     time_label: str = "Temps",
     duration_label: str = "Durée",
+    distance_elapsed: float | None = None,
+    distance_total: float | None = None,
 ):
-    draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
-    draw.text(
-        (draw_area["x"], draw_area["y"] + FONT_SIZE_LARGE + 10),
-        f"Altitude : {altitude:.0f} m",
-        font=font,
-        fill=text_color,
-    )
+    line_x = draw_area["x"]
+    line_y = draw_area["y"]
+    line_step = FONT_SIZE_LARGE + 10
 
-    if elapsed_seconds is None:
-        display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
-        time_line = f"Heure : {display_time}"
-    else:
+    draw.text((line_x, line_y), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
+    line_y += line_step
+
+    draw.text((line_x, line_y), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
+    line_y += line_step
+
+    display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
+    draw.text((line_x, line_y), f"Heure : {display_time}", font=font, fill=text_color)
+    line_y += line_step
+
+    if elapsed_seconds is not None:
         elapsed_text = format_hms(int(max(0, round(elapsed_seconds))))
         time_line = f"{time_label} : {elapsed_text}"
         if total_seconds is not None:
             total_text = format_hms(int(max(0, round(total_seconds))))
-            time_line += f" / {duration_label} : {total_text}"
+            time_line += f" / {total_text}"
+    else:
+        time_line = f"{time_label} : {display_time}"
 
-    draw.text(
-        (draw_area["x"], draw_area["y"] + 2 * (FONT_SIZE_LARGE + 10)),
-        time_line,
-        font=font,
-        fill=text_color,
-    )
-    draw.text(
-        (draw_area["x"], draw_area["y"] + 3 * (FONT_SIZE_LARGE + 10)),
-        f"Pente : {slope:.1f} %",
-        font=font,
-        fill=text_color,
-    )
+    draw.text((line_x, line_y), time_line, font=font, fill=text_color)
+    line_y += line_step
+
+    if distance_elapsed is not None:
+        dist_now_km = max(0.0, float(distance_elapsed)) / 1000.0
+        distance_line = f"Distance : {dist_now_km:.2f} km"
+        if distance_total is not None and distance_total > 0:
+            total_km = max(dist_now_km, float(distance_total) / 1000.0)
+            distance_line += f" / {total_km:.2f} km"
+    else:
+        distance_line = "Distance : —"
+
+    draw.text((line_x, line_y), distance_line, font=font, fill=text_color)
+    line_y += line_step
+
+    draw.text((line_x, line_y), f"Pente : {slope:.1f} %", font=font, fill=text_color)
 
 # --- AJOUT : texte allure & FC (dessiné sous les 3 lignes existantes) ---
 def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
-    y0 = draw_area["y"] + 4 * (FONT_SIZE_LARGE + 10)
+    y0 = draw_area["y"] + 6 * (FONT_SIZE_LARGE + 10)
     pace_txt = format_pace_mmss(pace_minpk)
     hr_txt = "—" if hr_bpm is None or not np.isfinite(hr_bpm) else f"{hr_bpm:.0f} bpm"
     draw.text((draw_area["x"], y0), f"Allure : {pace_txt}", font=font, fill=text_color)
@@ -1289,6 +1363,44 @@ def generate_gpx_video(
     interp_slopes = data["interp_slopes"]
     interp_pace = data["interp_pace"]
     interp_hrs = data["interp_hrs"]
+    interp_distances = data["interp_distances"]
+    clip_total_distance = float(interp_distances[-1]) if interp_distances.size else 0.0
+
+    full_track_reference = (
+        build_full_track_reference(points, fps, smoothing_seconds)
+        if show_full_track
+        else None
+    )
+    full_track_times = full_track_reference["times"] if full_track_reference else None
+    full_track_lats = full_track_reference["lats"] if full_track_reference else None
+    full_track_lons = full_track_reference["lons"] if full_track_reference else None
+    full_track_distances = (
+        full_track_reference["distances"] if full_track_reference else None
+    )
+    full_total_distance = (
+        float(full_track_distances[-1])
+        if full_track_distances is not None and full_track_distances.size
+        else None
+    )
+    interp_distances = data["interp_distances"]
+    clip_total_distance = float(interp_distances[-1]) if interp_distances.size else 0.0
+
+    full_track_reference = (
+        build_full_track_reference(points, fps, smoothing_seconds)
+        if show_full_track
+        else None
+    )
+    full_track_times = full_track_reference["times"] if full_track_reference else None
+    full_track_lats = full_track_reference["lats"] if full_track_reference else None
+    full_track_lons = full_track_reference["lons"] if full_track_reference else None
+    full_track_distances = (
+        full_track_reference["distances"] if full_track_reference else None
+    )
+    full_total_distance = (
+        float(full_track_distances[-1])
+        if full_track_distances is not None and full_track_distances.size
+        else None
+    )
 
 
     # Zones UI
@@ -1309,7 +1421,10 @@ def generate_gpx_video(
         return False
 
     # BBox brute & centre (option trace complète)
-    if show_full_track and points:
+    if show_full_track and full_track_lats is not None and full_track_lons is not None:
+        bbox_lats = np.asarray(full_track_lats, dtype=float)
+        bbox_lons = np.asarray(full_track_lons, dtype=float)
+    elif show_full_track and points:
         bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
         bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
     else:
@@ -1416,6 +1531,14 @@ def generate_gpx_video(
         # Positions "monde" au zoom choisi
         xs_world_selected, ys_world_selected = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
         xs_world_bbox, ys_world_bbox = lonlat_to_pixel_np(bbox_lons, bbox_lats, zoom)
+        if full_track_lats is not None and full_track_lons is not None:
+            xs_world_full, ys_world_full = lonlat_to_pixel_np(full_track_lons, full_track_lats, zoom)
+        else:
+            xs_world_full = ys_world_full = None
+        if full_track_lats is not None and full_track_lons is not None:
+            xs_world_full, ys_world_full = lonlat_to_pixel_np(full_track_lons, full_track_lats, zoom)
+        else:
+            xs_world_full = ys_world_full = None
 
         # Etendue, marge et image "large"
         x_min = float(np.min(xs_world_bbox)); x_max = float(np.max(xs_world_bbox))
@@ -1449,7 +1572,12 @@ def generate_gpx_video(
         global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        if show_full_track and points:
+        if show_full_track and xs_world_full is not None and ys_world_full is not None:
+            x_full_all = xs_world_full - x0_world
+            y_full_all = ys_world_full - y0_world
+            global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
+            full_local_xy_buffer = np.empty_like(global_xy_full)
+        elif show_full_track and points:
             x_full_all = xs_world_bbox - x0_world
             y_full_all = ys_world_bbox - y0_world
             global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
@@ -1493,6 +1621,47 @@ def generate_gpx_video(
             frame_img = Image.new("RGB", resolution, bg_c)
             draw = ImageDraw.Draw(frame_img)
 
+            current_dt = start_time + timedelta(seconds=float(interp_times[frame_idx]))
+            elapsed_seconds = None
+            if time_reference is not None:
+                try:
+                    elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
+                except Exception:
+                    elapsed_seconds = None
+
+            if interp_distances.size:
+                distance_elapsed_display = float(interp_distances[frame_idx])
+            else:
+                distance_elapsed_display = 0.0
+            distance_total_display = (
+                full_total_distance
+                if full_total_distance is not None
+                else (clip_total_distance if clip_total_distance > 0 else None)
+            )
+
+            full_progress_idx = None
+            if (
+                elapsed_seconds is not None
+                and full_track_times is not None
+                and getattr(full_track_times, "size", 0)
+            ):
+                idx = int(np.searchsorted(full_track_times, elapsed_seconds, side="right") - 1)
+                if idx < 0:
+                    idx = 0
+                if full_track_distances is not None and full_track_distances.size:
+                    idx_dist = min(idx, full_track_distances.size - 1)
+                    distance_elapsed_display = float(full_track_distances[idx_dist])
+                    if full_total_distance is not None:
+                        distance_total_display = full_total_distance
+                    else:
+                        distance_total_display = float(full_track_distances[-1])
+                if global_xy_full is not None and len(global_xy_full):
+                    full_progress_idx = min(idx, len(global_xy_full) - 1)
+            elif global_xy_full is not None and len(global_xy_full):
+                progress_ratio = frame_idx / max(1, total_frames - 1)
+                approx_idx = int(round(progress_ratio * (len(global_xy_full) - 1)))
+                full_progress_idx = max(0, min(len(global_xy_full) - 1, approx_idx))
+
             # Patch centré sur le point courant
             xc = float(x_full_selected[frame_idx]); yc = float(y_full_selected[frame_idx])
             patch_left = int(round(xc - patch_w / 2.0))
@@ -1517,6 +1686,12 @@ def generate_gpx_video(
                 full_local_xy_list = [(int(pt[0]), int(pt[1])) for pt in full_local_xy_buffer]
                 if len(full_local_xy_list) >= 2:
                     pdraw.line(full_local_xy_list, fill=map_path_c, width=2)
+                    if full_progress_idx is not None and full_progress_idx >= 1:
+                        pdraw.line(
+                            full_local_xy_list[: full_progress_idx + 1],
+                            fill=map_current_path_c,
+                            width=3,
+                        )
 
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
@@ -1602,13 +1777,6 @@ def generate_gpx_video(
                 draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
             if info_area.get("visible", False):
-                current_dt = start_time + timedelta(seconds=float(interp_times[frame_idx]))
-                elapsed_seconds = None
-                if time_reference is not None:
-                    try:
-                        elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
-                    except Exception:
-                        elapsed_seconds = None
                 draw_info_text(
                     draw,
                     float(interp_speeds[frame_idx]),
@@ -1623,6 +1791,8 @@ def generate_gpx_video(
                     total_seconds=total_duration_seconds,
                     time_label=time_label,
                     duration_label=duration_label,
+                    distance_elapsed=distance_elapsed_display,
+                    distance_total=distance_total_display,
                 )
                 # --- Texte Allure & FC supplémentaires ---
                 pace_now = float(interp_pace[frame_idx])
@@ -1744,7 +1914,10 @@ def render_first_frame_image(
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
         raise ValueError("Zone carte non visible ou dimensions nulles.")
 
-    if show_full_track and points:
+    if show_full_track and full_track_lats is not None and full_track_lons is not None:
+        bbox_lats = np.asarray(full_track_lats, dtype=float)
+        bbox_lons = np.asarray(full_track_lons, dtype=float)
+    elif show_full_track and points:
         bbox_lats = np.array([pt["lat"] for pt in points], dtype=float)
         bbox_lons = np.array([pt["lon"] for pt in points], dtype=float)
     else:
@@ -1839,6 +2012,25 @@ def render_first_frame_image(
     frame_idx = 0
     heading_deg = 0.0
 
+    current_dt = start_time + timedelta(seconds=float(interp_times[0]))
+    elapsed_seconds = None
+    if time_reference is not None:
+        try:
+            elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
+        except Exception:
+            elapsed_seconds = None
+
+    if interp_distances.size:
+        distance_elapsed_display = float(interp_distances[0])
+    else:
+        distance_elapsed_display = 0.0
+    distance_total_display = (
+        full_total_distance
+        if full_total_distance is not None
+        else (clip_total_distance if clip_total_distance > 0 else None)
+    )
+    full_progress_idx = None
+
     try:
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
         est_h = int(min(MAX_LARGE_DIM, mh * 6))
@@ -1876,7 +2068,12 @@ def render_first_frame_image(
         global_xy = np.column_stack((np.rint(x_full_selected).astype(int), np.rint(y_full_selected).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        if show_full_track and points:
+        if show_full_track and xs_world_full is not None and ys_world_full is not None:
+            x_full_all = xs_world_full - x0_world
+            y_full_all = ys_world_full - y0_world
+            global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
+            full_local_xy_buffer = np.empty_like(global_xy_full)
+        elif show_full_track and points:
             x_full_all = xs_world_bbox - x0_world
             y_full_all = ys_world_bbox - y0_world
             global_xy_full = np.column_stack((np.rint(x_full_all).astype(int), np.rint(y_full_all).astype(int)))
@@ -1884,6 +2081,27 @@ def render_first_frame_image(
         else:
             global_xy_full = None
             full_local_xy_buffer = None
+
+        if (
+            elapsed_seconds is not None
+            and full_track_times is not None
+            and getattr(full_track_times, "size", 0)
+            and global_xy_full is not None
+            and len(global_xy_full)
+        ):
+            idx = int(np.searchsorted(full_track_times, elapsed_seconds, side="right") - 1)
+            if idx < 0:
+                idx = 0
+            if full_track_distances is not None and full_track_distances.size:
+                idx_dist = min(idx, full_track_distances.size - 1)
+                distance_elapsed_display = float(full_track_distances[idx_dist])
+                if full_total_distance is not None:
+                    distance_total_display = full_total_distance
+                else:
+                    distance_total_display = float(full_track_distances[-1])
+            full_progress_idx = min(idx, len(global_xy_full) - 1)
+        elif global_xy_full is not None and len(global_xy_full):
+            full_progress_idx = 0
 
         headings = []
         for i in range(total_frames):
@@ -1931,6 +2149,12 @@ def render_first_frame_image(
             full_local_xy_list = [(int(pt[0]), int(pt[1])) for pt in full_local_xy_buffer]
             if len(full_local_xy_list) >= 2:
                 pdraw.line(full_local_xy_list, fill=map_path_c, width=2)
+                if full_progress_idx is not None and full_progress_idx >= 1:
+                    pdraw.line(
+                        full_local_xy_list[: full_progress_idx + 1],
+                        fill=map_current_path_c,
+                        width=3,
+                    )
         np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
         np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
         local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
@@ -2008,13 +2232,6 @@ def render_first_frame_image(
     if compass_area.get("visible", False):
         draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
     if info_area.get("visible", False):
-        current_dt = start_time + timedelta(seconds=float(interp_times[0]))
-        elapsed_seconds = None
-        if time_reference is not None:
-            try:
-                elapsed_seconds = max(0.0, (current_dt - time_reference).total_seconds())
-            except Exception:
-                elapsed_seconds = None
         draw_info_text(
             draw,
             float(interp_speeds[0]),
@@ -2029,6 +2246,8 @@ def render_first_frame_image(
             total_seconds=total_duration_seconds,
             time_label=time_label,
             duration_label=duration_label,
+            distance_elapsed=distance_elapsed_display,
+            distance_total=distance_total_display,
         )
         pace_now = float(interp_pace[0])
         hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
