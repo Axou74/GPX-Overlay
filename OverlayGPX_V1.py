@@ -255,14 +255,37 @@ def parse_gpx(filepath: str):
         return [], None, None
     return points, gpx_start_time, gpx_end_time
 
-def filter_points_by_time(points, start_time_str, duration_seconds, timezone_str):
+def filter_points_by_time(
+    points,
+    start_time_str,
+    duration_seconds,
+    timezone_str,
+    pre_context_seconds: int = 0,
+    post_context_seconds: int = 0,
+):
     tz = pytz.timezone(timezone_str)
     start_time = tz.localize(datetime.fromisoformat(start_time_str))
     end_time = start_time + timedelta(seconds=duration_seconds)
-    filtered = [pt for pt in points if start_time <= pt["time"].astimezone(tz) <= end_time]
-    if len(filtered) < 2:
+    pre_context_seconds = max(0, int(pre_context_seconds))
+    post_context_seconds = max(0, int(post_context_seconds))
+    context_start = start_time - timedelta(seconds=pre_context_seconds)
+    context_end = end_time + timedelta(seconds=post_context_seconds)
+
+    context_points = [
+        pt
+        for pt in points
+        if context_start <= pt["time"].astimezone(tz) <= context_end
+    ]
+    if len(context_points) < 2:
         raise ValueError("Pas assez de points GPX pour la plage horaire spécifiée.")
-    return filtered, start_time, tz
+
+    clip_points = [
+        pt for pt in context_points if start_time <= pt["time"].astimezone(tz) <= end_time
+    ]
+    if len(clip_points) < 2:
+        raise ValueError("Pas assez de points GPX pour le clip demandé.")
+
+    return context_points, clip_points, start_time, tz
 
 def interpolate_data(times, data, interp_times, s: float = 0):
     unique_times, unique_indices = np.unique(times, return_index=True)
@@ -1156,6 +1179,8 @@ def generate_gpx_video(
     zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
     progress_callback=None,
+    pre_context_seconds: int = 0,
+    post_context_seconds: int = 0,
 ) -> bool:
     # --- Config interne ---
     PATCH_FACTOR = 2.4
@@ -1187,6 +1212,10 @@ def generate_gpx_video(
     compass_area = element_configs.get("Boussole (ruban)", {})
 
 
+    pre_context_seconds = max(0, int(pre_context_seconds))
+    post_context_seconds = max(0, int(post_context_seconds))
+    context_duration = clip_duration + pre_context_seconds + post_context_seconds
+
     # GPX
     points, gpx_start, _ = parse_gpx(gpx_filename)
     if not points:
@@ -1195,34 +1224,72 @@ def generate_gpx_video(
     try:
         if gpx_start is None:
             raise ValueError("Horodatage GPX invalide")
-        tz = "Europe/Paris"
+        tz_str = "Europe/Paris"
         start_time = gpx_start + timedelta(seconds=start_offset)
-        start_str = start_time.astimezone(pytz.timezone(tz)).replace(tzinfo=None).isoformat()
-        filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz)
+        start_str = start_time.astimezone(pytz.timezone(tz_str)).replace(tzinfo=None).isoformat()
+        context_points, clip_points, clip_start_time, tz = filter_points_by_time(
+            points,
+            start_str,
+            clip_duration,
+            tz_str,
+            pre_context_seconds,
+            post_context_seconds,
+        )
     except ValueError as e:
         print(f"Erreur: {e}")
         return False
 
-    times_seconds = np.array([(pt["time"] - start_time).total_seconds() for pt in filtered_points], dtype=float)
-    lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
-    lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
-    eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
+    clip_times_seconds = np.array(
+        [(pt["time"] - clip_start_time).total_seconds() for pt in clip_points],
+        dtype=float,
+    )
+    clip_lats = np.array([pt["lat"] for pt in clip_points], dtype=float)
+    clip_lons = np.array([pt["lon"] for pt in clip_points], dtype=float)
+    clip_eles = np.array([pt["ele"] for pt in clip_points], dtype=float)
+    clip_hrs_raw = np.array(
+        [pt.get("hr") if pt.get("hr") is not None else np.nan for pt in clip_points],
+        dtype=float,
+    )
 
+    context_start_time = clip_start_time - timedelta(seconds=pre_context_seconds)
+    context_times_seconds = np.array(
+        [(pt["time"] - context_start_time).total_seconds() for pt in context_points],
+        dtype=float,
+    )
+    context_lats = np.array([pt["lat"] for pt in context_points], dtype=float)
+    context_lons = np.array([pt["lon"] for pt in context_points], dtype=float)
+    context_eles = np.array([pt["ele"] for pt in context_points], dtype=float)
+    context_hrs_raw = np.array(
+        [
+            pt.get("hr") if pt.get("hr") is not None else np.nan
+            for pt in context_points
+        ],
+        dtype=float,
+    )
 
-
-    data = prepare_track_arrays(
-        times_seconds,
-        lats,
-        lons,
-        eles,
-        hrs_raw,
+    clip_data = prepare_track_arrays(
+        clip_times_seconds,
+        clip_lats,
+        clip_lons,
+        clip_eles,
+        clip_hrs_raw,
         clip_duration,
         fps,
         smoothing_seconds,
     )
 
-    total_frames = data["total_frames"]
+    context_data = prepare_track_arrays(
+        context_times_seconds,
+        context_lats,
+        context_lons,
+        context_eles,
+        context_hrs_raw,
+        context_duration,
+        fps,
+        smoothing_seconds,
+    )
+
+    total_frames = clip_data["total_frames"]
 
     print(f"Génération de {total_frames} images…")
     t0 = time.time()
@@ -1241,14 +1308,33 @@ def generate_gpx_video(
             )
             sys.stdout.flush()
 
-    interp_times = data["interp_times"]
-    interp_lats = data["interp_lats"]
-    interp_lons = data["interp_lons"]
-    interp_eles = data["interp_eles"]
-    interp_speeds = data["interp_speeds"]
-    interp_slopes = data["interp_slopes"]
-    interp_pace = data["interp_pace"]
-    interp_hrs = data["interp_hrs"]
+    interp_times = clip_data["interp_times"]
+    interp_lats = clip_data["interp_lats"]
+    interp_lons = clip_data["interp_lons"]
+    interp_eles = clip_data["interp_eles"]
+    interp_speeds = clip_data["interp_speeds"]
+    interp_slopes = clip_data["interp_slopes"]
+    interp_pace = clip_data["interp_pace"]
+    interp_hrs = clip_data["interp_hrs"]
+
+    context_interp_times = context_data["interp_times"]
+    context_interp_lats = context_data["interp_lats"]
+    context_interp_lons = context_data["interp_lons"]
+    context_interp_eles = context_data["interp_eles"]
+    context_interp_speeds = context_data["interp_speeds"]
+    context_interp_pace = context_data["interp_pace"]
+    context_interp_hrs = context_data["interp_hrs"]
+
+    if context_interp_times.size:
+        absolute_times = pre_context_seconds + interp_times
+        context_progress_indices = np.searchsorted(
+            context_interp_times, absolute_times, side="right"
+        ) - 1
+        context_progress_indices = np.clip(
+            context_progress_indices, 0, len(context_interp_times) - 1
+        )
+    else:
+        context_progress_indices = np.zeros_like(interp_times, dtype=int)
 
 
     # Zones UI
@@ -1269,23 +1355,31 @@ def generate_gpx_video(
         return False
 
     # BBox brute & centre
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    lat_min_raw = float(np.min(context_interp_lats))
+    lat_max_raw = float(np.max(context_interp_lats))
+    lon_min_raw = float(np.min(context_interp_lons))
+    lon_max_raw = float(np.max(context_interp_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
     # Profils (altitude & vitesse)
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
+    elev_min = float(np.min(context_interp_eles))
+    elev_max = float(np.max(context_interp_eles))
     elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
+    elev_path = [
+        elev_tf.to_xy(i, val, len(context_interp_eles))
+        for i, val in enumerate(context_interp_eles)
+    ]
 
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
+    speed_min_val = float(np.min(context_interp_speeds))
+    speed_max_val = float(np.max(context_interp_speeds))
+    speed_min, speed_max = auto_speed_bounds(context_interp_speeds)
 
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
+    speed_path = [
+        speed_tf.to_xy(i, val, len(context_interp_speeds))
+        for i, val in enumerate(context_interp_speeds)
+    ]
 
     # --- AJOUT : profils Allure & Cardio ---
 
@@ -1299,20 +1393,23 @@ def generate_gpx_video(
                 if not np.isfinite(val)
                 else max(pace_min, min(float(val), pace_max))
             ),
-            len(interp_pace),
+            len(context_interp_pace),
         )
-        for i, val in enumerate(interp_pace)
+        for i, val in enumerate(context_interp_pace)
     ]
 
 
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
+    has_hr = np.isfinite(context_interp_hrs).sum() >= 1
     if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
+        hr_vals = context_interp_hrs[np.isfinite(context_interp_hrs)]
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
     hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
+    hr_path = [
+        hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(context_interp_hrs))
+        for i, val in enumerate(context_interp_hrs)
+    ]
 
     graph_specs = [
         (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
@@ -1340,11 +1437,14 @@ def generate_gpx_video(
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
         # Positions "monde" au zoom choisi
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        clip_xs_world, clip_ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        context_xs_world, context_ys_world = lonlat_to_pixel_np(
+            context_interp_lons, context_interp_lats, zoom
+        )
 
         # Etendue, marge et image "large"
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        x_min = float(np.min(context_xs_world)); x_max = float(np.max(context_xs_world))
+        y_min = float(np.min(context_ys_world)); y_max = float(np.max(context_ys_world))
         track_w = x_max - x_min; track_h = y_max - y_min
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
@@ -1369,10 +1469,14 @@ def generate_gpx_video(
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
         # Trace dans le repère "large"
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
+        clip_x_full = clip_xs_world - x0_world
+        clip_y_full = clip_ys_world - y0_world
+        context_x_full = context_xs_world - x0_world
+        context_y_full = context_ys_world - y0_world
+        context_global_xy = np.column_stack(
+            (np.rint(context_x_full).astype(int), np.rint(context_y_full).astype(int))
+        )
+        context_local_xy_buffer = np.empty_like(context_global_xy)
 
         # Tête lissée (pour rotation)
         if total_frames == 0:
@@ -1381,10 +1485,10 @@ def generate_gpx_video(
             dx = np.zeros(total_frames, dtype=float)
             dy = np.zeros(total_frames, dtype=float)
             if total_frames > 1:
-                dx[:-1] = np.diff(x_full)
-                dy[:-1] = np.diff(y_full)
-                dx[-1] = x_full[-1] - x_full[-2]
-                dy[-1] = y_full[-1] - y_full[-2]
+                dx[:-1] = np.diff(clip_x_full)
+                dy[:-1] = np.diff(clip_y_full)
+                dx[-1] = clip_x_full[-1] - clip_x_full[-2]
+                dy[-1] = clip_y_full[-1] - clip_y_full[-2]
             headings = np.zeros(total_frames, dtype=float)
             non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
             headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
@@ -1410,7 +1514,7 @@ def generate_gpx_video(
             draw = ImageDraw.Draw(frame_img)
 
             # Patch centré sur le point courant
-            xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
+            xc = float(clip_x_full[frame_idx]); yc = float(clip_y_full[frame_idx])
             patch_left = int(round(xc - patch_w / 2.0))
             patch_top  = int(round(yc - patch_h / 2.0))
             patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
@@ -1427,12 +1531,38 @@ def generate_gpx_video(
 
             # Trace + progression + point (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
-            np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-            np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
-            pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy_buffer[frame_idx]
+            np.subtract(
+                context_global_xy[:, 0], patch_left, out=context_local_xy_buffer[:, 0]
+            )
+            np.subtract(
+                context_global_xy[:, 1], patch_top, out=context_local_xy_buffer[:, 1]
+            )
+            context_local_list = [
+                (int(pt[0]), int(pt[1])) for pt in context_local_xy_buffer
+            ]
+            if len(context_local_list) >= 2:
+                pdraw.line(context_local_list, fill=map_path_c, width=3)
+            elif len(context_local_list) == 1:
+                px, py = context_local_list[0]
+                pdraw.ellipse((px - 1, py - 1, px + 1, py + 1), fill=map_path_c)
+
+            highlight_idx = int(context_progress_indices[frame_idx]) if context_local_list else -1
+            last_highlight_point = None
+            if highlight_idx >= 0 and context_local_list:
+                highlight_idx = min(highlight_idx, len(context_local_list) - 1)
+                highlight_path = context_local_list[: highlight_idx + 1]
+                if len(highlight_path) >= 2:
+                    pdraw.line(highlight_path, fill=map_current_path_c, width=4)
+                elif len(highlight_path) == 1:
+                    px, py = highlight_path[0]
+                    pdraw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=map_current_path_c)
+                if highlight_path:
+                    last_highlight_point = highlight_path[-1]
+
+            cxp = int(round(clip_x_full[frame_idx] - patch_left))
+            cyp = int(round(clip_y_full[frame_idx] - patch_top))
+            if last_highlight_point and last_highlight_point != (cxp, cyp):
+                pdraw.line([last_highlight_point, (cxp, cyp)], fill=map_current_path_c, width=4)
             r = 6
             pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
@@ -1466,7 +1596,7 @@ def generate_gpx_video(
                 draw_graph_progress_overlay(
                     draw,
                     layer["path"],
-                    frame_idx,
+                    int(context_progress_indices[frame_idx]) if len(layer["path"]) else 0,
                     layer["base_color"],
                     layer["point_color"],
                     layer["point_size"],
@@ -1514,7 +1644,7 @@ def generate_gpx_video(
                                float(interp_speeds[frame_idx]),
                                float(interp_eles[frame_idx]),
                                float(interp_slopes[frame_idx]),
-                               start_time + timedelta(seconds=float(interp_times[frame_idx])),
+                               clip_start_time + timedelta(seconds=float(interp_times[frame_idx])),
                                info_area, font_medium, tz, text_c)
                 # --- Texte Allure & FC supplémentaires ---
                 pace_now = float(interp_pace[frame_idx])
@@ -1554,6 +1684,8 @@ def render_first_frame_image(
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
+    pre_context_seconds: int = 0,
+    post_context_seconds: int = 0,
 ):
     # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
@@ -1582,6 +1714,10 @@ def render_first_frame_image(
     text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
     gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
 
+    pre_context_seconds = max(0, int(pre_context_seconds))
+    post_context_seconds = max(0, int(post_context_seconds))
+    context_duration = clip_duration + pre_context_seconds + post_context_seconds
+
     points, gpx_start, _ = parse_gpx(gpx_filename)
     if not points:
         raise ValueError("Aucun point GPX.")
@@ -1590,33 +1726,93 @@ def render_first_frame_image(
     tz_str = "Europe/Paris"
     start_time = gpx_start + timedelta(seconds=start_offset)
     start_str = start_time.astimezone(pytz.timezone(tz_str)).replace(tzinfo=None).isoformat()
-    filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz_str)
+    context_points, clip_points, clip_start_time, tz = filter_points_by_time(
+        points,
+        start_str,
+        clip_duration,
+        tz_str,
+        pre_context_seconds,
+        post_context_seconds,
+    )
 
-    times = np.array([(pt["time"] - start_time).total_seconds() for pt in filtered_points], dtype=float)
-    lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
-    lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
-    eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
+    clip_times = np.array(
+        [(pt["time"] - clip_start_time).total_seconds() for pt in clip_points],
+        dtype=float,
+    )
+    clip_lats = np.array([pt["lat"] for pt in clip_points], dtype=float)
+    clip_lons = np.array([pt["lon"] for pt in clip_points], dtype=float)
+    clip_eles = np.array([pt["ele"] for pt in clip_points], dtype=float)
+    clip_hrs_raw = np.array(
+        [pt.get("hr") if pt.get("hr") is not None else np.nan for pt in clip_points],
+        dtype=float,
+    )
 
-    data = prepare_track_arrays(
-        times,
-        lats,
-        lons,
-        eles,
-        hrs_raw,
+    context_start_time = clip_start_time - timedelta(seconds=pre_context_seconds)
+    context_times = np.array(
+        [(pt["time"] - context_start_time).total_seconds() for pt in context_points],
+        dtype=float,
+    )
+    context_lats = np.array([pt["lat"] for pt in context_points], dtype=float)
+    context_lons = np.array([pt["lon"] for pt in context_points], dtype=float)
+    context_eles = np.array([pt["ele"] for pt in context_points], dtype=float)
+    context_hrs_raw = np.array(
+        [
+            pt.get("hr") if pt.get("hr") is not None else np.nan
+            for pt in context_points
+        ],
+        dtype=float,
+    )
+
+    clip_data = prepare_track_arrays(
+        clip_times,
+        clip_lats,
+        clip_lons,
+        clip_eles,
+        clip_hrs_raw,
         clip_duration,
         fps,
         smoothing_seconds,
     )
-    total_frames = data["total_frames"]
-    interp_times = data["interp_times"]
-    interp_lats = data["interp_lats"]
-    interp_lons = data["interp_lons"]
-    interp_eles = data["interp_eles"]
-    interp_speeds = data["interp_speeds"]
-    interp_slopes = data["interp_slopes"]
-    interp_pace = data["interp_pace"]
-    interp_hrs = data["interp_hrs"]
+
+    context_data = prepare_track_arrays(
+        context_times,
+        context_lats,
+        context_lons,
+        context_eles,
+        context_hrs_raw,
+        context_duration,
+        fps,
+        smoothing_seconds,
+    )
+
+    total_frames = clip_data["total_frames"]
+    interp_times = clip_data["interp_times"]
+    interp_lats = clip_data["interp_lats"]
+    interp_lons = clip_data["interp_lons"]
+    interp_eles = clip_data["interp_eles"]
+    interp_speeds = clip_data["interp_speeds"]
+    interp_slopes = clip_data["interp_slopes"]
+    interp_pace = clip_data["interp_pace"]
+    interp_hrs = clip_data["interp_hrs"]
+
+    context_interp_times = context_data["interp_times"]
+    context_interp_lats = context_data["interp_lats"]
+    context_interp_lons = context_data["interp_lons"]
+    context_interp_eles = context_data["interp_eles"]
+    context_interp_speeds = context_data["interp_speeds"]
+    context_interp_pace = context_data["interp_pace"]
+    context_interp_hrs = context_data["interp_hrs"]
+
+    if context_interp_times.size:
+        absolute_times = pre_context_seconds + interp_times
+        context_progress_indices = np.searchsorted(
+            context_interp_times, absolute_times, side="right"
+        ) - 1
+        context_progress_indices = np.clip(
+            context_progress_indices, 0, len(context_interp_times) - 1
+        )
+    else:
+        context_progress_indices = np.zeros_like(interp_times, dtype=int)
 
 
     map_area = element_configs.get("Carte", {})
@@ -1635,22 +1831,30 @@ def render_first_frame_image(
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
         raise ValueError("Zone carte non visible ou dimensions nulles.")
 
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    lat_min_raw = float(np.min(context_interp_lats))
+    lat_max_raw = float(np.max(context_interp_lats))
+    lon_min_raw = float(np.min(context_interp_lons))
+    lon_max_raw = float(np.max(context_interp_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
-    elev_min = float(np.min(interp_eles))
-    elev_max = float(np.max(interp_eles))
+    elev_min = float(np.min(context_interp_eles))
+    elev_max = float(np.max(context_interp_eles))
     elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
-    elev_path = [elev_tf.to_xy(i, val, len(interp_eles)) for i, val in enumerate(interp_eles)]
+    elev_path = [
+        elev_tf.to_xy(i, val, len(context_interp_eles))
+        for i, val in enumerate(context_interp_eles)
+    ]
 
-    speed_min_val = float(np.min(interp_speeds))
-    speed_max_val = float(np.max(interp_speeds))
-    speed_min, speed_max = auto_speed_bounds(interp_speeds)
+    speed_min_val = float(np.min(context_interp_speeds))
+    speed_max_val = float(np.max(context_interp_speeds))
+    speed_min, speed_max = auto_speed_bounds(context_interp_speeds)
 
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
-    speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
+    speed_path = [
+        speed_tf.to_xy(i, val, len(context_interp_speeds))
+        for i, val in enumerate(context_interp_speeds)
+    ]
 
     pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
     pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
@@ -1662,19 +1866,22 @@ def render_first_frame_image(
                 if not np.isfinite(val)
                 else max(pace_min, min(float(val), pace_max))
             ),
-            len(interp_pace),
+            len(context_interp_pace),
         )
-        for i, val in enumerate(interp_pace)
+        for i, val in enumerate(context_interp_pace)
     ]
 
-    has_hr = np.isfinite(interp_hrs).sum() >= 1
+    has_hr = np.isfinite(context_interp_hrs).sum() >= 1
     if has_hr:
-        hr_vals = interp_hrs[np.isfinite(interp_hrs)]
+        hr_vals = context_interp_hrs[np.isfinite(context_interp_hrs)]
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
     hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
-    hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
+    hr_path = [
+        hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(context_interp_hrs))
+        for i, val in enumerate(context_interp_hrs)
+    ]
 
     graph_specs = [
         (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
@@ -1702,12 +1909,14 @@ def render_first_frame_image(
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        clip_xs_world, clip_ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+        context_xs_world, context_ys_world = lonlat_to_pixel_np(
+            context_interp_lons, context_interp_lats, zoom
+        )
 
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
+        x_min = float(np.min(context_xs_world)); x_max = float(np.max(context_xs_world))
+        y_min = float(np.min(context_ys_world)); y_max = float(np.max(context_ys_world))
         track_w = x_max - x_min; track_h = y_max - y_min
-
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
@@ -1727,19 +1936,23 @@ def render_first_frame_image(
         except Exception:
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
+        clip_x_full = clip_xs_world - x0_world
+        clip_y_full = clip_ys_world - y0_world
+        context_x_full = context_xs_world - x0_world
+        context_y_full = context_ys_world - y0_world
+        context_global_xy = np.column_stack(
+            (np.rint(context_x_full).astype(int), np.rint(context_y_full).astype(int))
+        )
+        context_local_xy_buffer = np.empty_like(context_global_xy)
 
         headings = []
         for i in range(total_frames):
             if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
+                dx = clip_x_full[i + 1] - clip_x_full[i]
+                dy = clip_y_full[i + 1] - clip_y_full[i]
             else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
+                dx = clip_x_full[i] - clip_x_full[i - 1]
+                dy = clip_y_full[i] - clip_y_full[i - 1]
             if abs(dx) > 1e-9 or abs(dy) > 1e-9:
                 headings.append(math.atan2(dx, -dy))
             else:
@@ -1755,8 +1968,8 @@ def render_first_frame_image(
             avg = np.mean(complex_raw[a:b])
             smoothed_angles.append(math.atan2(avg.imag, avg.real))
 
-        xc = float(x_full[0])
-        yc = float(y_full[0])
+        xc = float(clip_x_full[0])
+        yc = float(clip_y_full[0])
         patch_left = int(round(xc - patch_w / 2.0))
         patch_top = int(round(yc - patch_h / 2.0))
         patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
@@ -1772,12 +1985,34 @@ def render_first_frame_image(
             patch_img.paste(crop, (dest_x, dest_y))
 
         pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[0]
+        np.subtract(context_global_xy[:, 0], patch_left, out=context_local_xy_buffer[:, 0])
+        np.subtract(context_global_xy[:, 1], patch_top, out=context_local_xy_buffer[:, 1])
+        context_local_list = [
+            (int(pt[0]), int(pt[1])) for pt in context_local_xy_buffer
+        ]
+        if len(context_local_list) >= 2:
+            pdraw.line(context_local_list, fill=map_path_c, width=3)
+        elif len(context_local_list) == 1:
+            px, py = context_local_list[0]
+            pdraw.ellipse((px - 1, py - 1, px + 1, py + 1), fill=map_path_c)
+
+        highlight_idx = int(context_progress_indices[0]) if context_local_list else -1
+        last_highlight_point = None
+        if highlight_idx >= 0 and context_local_list:
+            highlight_idx = min(highlight_idx, len(context_local_list) - 1)
+            highlight_path = context_local_list[: highlight_idx + 1]
+            if len(highlight_path) >= 2:
+                pdraw.line(highlight_path, fill=map_current_path_c, width=4)
+            elif len(highlight_path) == 1:
+                px, py = highlight_path[0]
+                pdraw.ellipse((px - 2, py - 2, px + 2, py + 2), fill=map_current_path_c)
+            if highlight_path:
+                last_highlight_point = highlight_path[-1]
+
+        cxp = int(round(clip_x_full[0] - patch_left))
+        cyp = int(round(clip_y_full[0] - patch_top))
+        if last_highlight_point and last_highlight_point != (cxp, cyp):
+            pdraw.line([last_highlight_point, (cxp, cyp)], fill=map_current_path_c, width=4)
         r = 6
         pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
@@ -1806,7 +2041,7 @@ def render_first_frame_image(
         draw_graph_progress_overlay(
             draw,
             layer["path"],
-            0,
+            int(context_progress_indices[0]) if len(layer["path"]) else 0,
             layer["base_color"],
             layer["point_color"],
             layer["point_size"],
@@ -1852,7 +2087,7 @@ def render_first_frame_image(
                        float(interp_speeds[0]),
                        float(interp_eles[0]),
                        float(interp_slopes[0]),
-                       start_time + timedelta(seconds=float(interp_times[0])),
+                       clip_start_time + timedelta(seconds=float(interp_times[0])),
                        info_area, font_medium, tz, text_c)
         pace_now = float(interp_pace[0])
         hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
@@ -2035,11 +2270,42 @@ class GPXVideoApp:
         self.duration_scale.pack(fill=tk.X, pady=2)
         self.duration_label = ttk.Label(gen_params_frame, text="0:00:00")
         self.duration_label.pack(fill=tk.X, pady=2)
+        self.pre_context_var = tk.IntVar(value=0)
+        self.post_context_var = tk.IntVar(value=0)
+        ttk.Label(gen_params_frame, text="Contexte avant le clip (s):").pack(fill=tk.X, pady=2)
+        self.pre_context_scale = ttk.Scale(
+            gen_params_frame,
+            from_=0,
+            to=0,
+            variable=self.pre_context_var,
+            orient=tk.HORIZONTAL,
+        )
+        self.pre_context_scale.pack(fill=tk.X, pady=2)
+        self.pre_context_label = ttk.Label(gen_params_frame, text="0:00:00")
+        self.pre_context_label.pack(fill=tk.X, pady=2)
+
+        ttk.Label(gen_params_frame, text="Contexte après le clip (s):").pack(fill=tk.X, pady=2)
+        self.post_context_scale = ttk.Scale(
+            gen_params_frame,
+            from_=0,
+            to=0,
+            variable=self.post_context_var,
+            orient=tk.HORIZONTAL,
+        )
+        self.post_context_scale.pack(fill=tk.X, pady=2)
+        self.post_context_label = ttk.Label(gen_params_frame, text="0:00:00")
+        self.post_context_label.pack(fill=tk.X, pady=2)
         self.clip_time_label = ttk.Label(gen_params_frame, text="Clip: début N/A - fin N/A")
         self.clip_time_label.pack(fill=tk.X, pady=2)
+        self.context_time_label = ttk.Label(gen_params_frame, text="Contexte: début N/A - fin N/A")
+        self.context_time_label.pack(fill=tk.X, pady=2)
         self.duration_var.trace_add("write", self.on_duration_slider_change)
         self.update_duration_label()
         self.update_clip_time_label()
+        self.pre_context_var.trace_add("write", self.on_pre_context_change)
+        self.post_context_var.trace_add("write", self.on_post_context_change)
+        self.update_pre_context_label()
+        self.update_post_context_label()
 
 
         ttk.Label(gen_params_frame, text="FPS:").pack(fill=tk.X, pady=2)
@@ -2305,6 +2571,8 @@ class GPXVideoApp:
             self.start_offset_var.set(max_start)
 
         self.update_start_offset_label()
+        self.update_pre_context_max()
+        self.update_post_context_max()
 
     def update_duration_max(self, *args):
         if not (self.gpx_start_time_raw and self.gpx_end_time_raw):
@@ -2316,6 +2584,29 @@ class GPXVideoApp:
         if self.duration_var.get() > max_dur:
             self.duration_var.set(max_dur)
         self.update_duration_label()
+        self.update_post_context_max()
+
+    def update_pre_context_max(self, *args):
+        max_pre = int(self.start_offset_var.get()) if self.gpx_start_time_raw else 0
+        self.pre_context_scale.config(to=max_pre)
+        if self.pre_context_var.get() > max_pre:
+            self.pre_context_var.set(max_pre)
+        else:
+            self.update_pre_context_label()
+
+    def update_post_context_max(self, *args):
+        if not (self.gpx_start_time_raw and self.gpx_end_time_raw):
+            max_post = 0
+        else:
+            total_sec = int((self.gpx_end_time_raw - self.gpx_start_time_raw).total_seconds())
+            start = int(self.start_offset_var.get())
+            dur = int(self.duration_var.get())
+            max_post = max(0, total_sec - (start + dur))
+        self.post_context_scale.config(to=max_post)
+        if self.post_context_var.get() > max_post:
+            self.post_context_var.set(max_post)
+        else:
+            self.update_post_context_label()
 
     def update_clip_time_label(self):
         if self.gpx_start_time_raw:
@@ -2326,6 +2617,7 @@ class GPXVideoApp:
             )
         else:
             self.clip_time_label.config(text="Clip: début N/A - fin N/A")
+        self.update_context_time_label()
 
     def update_start_offset_label(self, *args):
         start = int(self.start_offset_var.get())
@@ -2341,15 +2633,50 @@ class GPXVideoApp:
         dur = int(self.duration_var.get())
         self.duration_label.config(text=format_hms(dur))
 
+    def update_pre_context_label(self, *args):
+        pre = int(self.pre_context_var.get())
+        self.pre_context_label.config(text=format_hms(pre))
+        self.update_context_time_label()
+
+    def update_post_context_label(self, *args):
+        post = int(self.post_context_var.get())
+        self.post_context_label.config(text=format_hms(post))
+        self.update_context_time_label()
+
+    def update_context_time_label(self):
+        if self.gpx_start_time_raw:
+            clip_start = self.gpx_start_time_raw + timedelta(seconds=int(self.start_offset_var.get()))
+            clip_end = clip_start + timedelta(seconds=int(self.duration_var.get()))
+            pre = int(self.pre_context_var.get())
+            post = int(self.post_context_var.get())
+            context_start = clip_start - timedelta(seconds=pre)
+            context_end = clip_end + timedelta(seconds=post)
+            self.context_time_label.config(
+                text=(
+                    f"Contexte: début {context_start.strftime('%H:%M:%S')} - "
+                    f"fin {context_end.strftime('%H:%M:%S')}"
+                )
+            )
+        else:
+            self.context_time_label.config(text="Contexte: début N/A - fin N/A")
+
     def on_start_offset_change(self, *args):
         self.update_start_offset_label()
         self.update_duration_max()
         self.update_clip_time_label()
+        self.update_pre_context_max()
 
     def on_duration_slider_change(self, *args):
         self.update_duration_label()
         self.update_start_offset_max()
         self.update_clip_time_label()
+        self.update_post_context_max()
+
+    def on_pre_context_change(self, *args):
+        self.update_pre_context_label()
+
+    def on_post_context_change(self, *args):
+        self.update_post_context_label()
 
     def show_preview(self, force_update: bool = False, initial_load: bool = False) -> None:
         if not initial_load and not force_update: return
@@ -2424,6 +2751,8 @@ class GPXVideoApp:
                 gpx_filename=self.gpx_file_path,
                 start_offset=int(self.start_offset_var.get()),
                 clip_duration=duration,
+                pre_context_seconds=int(self.pre_context_var.get()),
+                post_context_seconds=int(self.post_context_var.get()),
                 fps=fps,
                 resolution=res,
                 font_path=font_path,
@@ -2468,6 +2797,8 @@ class GPXVideoApp:
             self.gpx_start_time_raw = start; self.gpx_end_time_raw = end
             base = os.path.basename(filename)
             self.start_offset_var.set(0)
+            self.pre_context_var.set(0)
+            self.post_context_var.set(0)
 
             self.update_duration_max()
 
@@ -2568,6 +2899,8 @@ class GPXVideoApp:
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
                     smoothing_seconds=smoothing_seconds,
                     progress_callback=progress_cb,
+                    pre_context_seconds=int(self.pre_context_var.get()),
+                    post_context_seconds=int(self.post_context_var.get()),
                 )
             except Exception as e:
                 success = False
