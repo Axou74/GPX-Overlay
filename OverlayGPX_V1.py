@@ -192,6 +192,14 @@ def darken_color(color, factor=0.7):
     r, g, b = hex_to_rgb(color)
     return (int(r * factor), int(g * factor), int(b * factor))
 
+def lighten_color(color, factor=1.2):
+    r, g, b = hex_to_rgb(color)
+    return (
+        min(255, int(r * factor)),
+        min(255, int(g * factor)),
+        min(255, int(b * factor)),
+    )
+
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
     phi1, phi2 = map(math.radians, [lat1, lat2])
@@ -255,11 +263,24 @@ def parse_gpx(filepath: str):
         return [], None, None
     return points, gpx_start_time, gpx_end_time
 
-def filter_points_by_time(points, start_time_str, duration_seconds, timezone_str):
+def filter_points_by_time(
+    points,
+    start_time_str,
+    duration_seconds,
+    timezone_str,
+    before_seconds: int = 0,
+    after_seconds: int = 0,
+):
     tz = pytz.timezone(timezone_str)
     start_time = tz.localize(datetime.fromisoformat(start_time_str))
-    end_time = start_time + timedelta(seconds=duration_seconds)
-    filtered = [pt for pt in points if start_time <= pt["time"].astimezone(tz) <= end_time]
+    clip_end = start_time + timedelta(seconds=duration_seconds)
+    window_start = start_time - timedelta(seconds=max(0, int(before_seconds)))
+    window_end = clip_end + timedelta(seconds=max(0, int(after_seconds)))
+    filtered = [
+        pt
+        for pt in points
+        if window_start <= pt["time"].astimezone(tz) <= window_end
+    ]
     if len(filtered) < 2:
         raise ValueError("Pas assez de points GPX pour la plage horaire spécifiée.")
     return filtered, start_time, tz
@@ -330,9 +351,10 @@ def prepare_track_arrays(
     lons,
     eles,
     hrs_raw,
-    clip_duration,
+    duration_seconds,
     fps,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
+    start_offset: float = 0.0,
 ):
     """Pré-calcul des séries interpolées communes aux rendus avec lissage optionnel."""
 
@@ -344,8 +366,14 @@ def prepare_track_arrays(
     else:
         speeds = np.array([0.0])
 
-    total_frames = max(1, int(clip_duration * fps))
-    interp_times = np.linspace(0.0, float(clip_duration), num=total_frames, endpoint=False)
+    duration_seconds = float(duration_seconds)
+    total_frames = max(1, int(round(duration_seconds * fps)))
+    interp_times = np.linspace(
+        float(start_offset),
+        float(start_offset) + duration_seconds,
+        num=total_frames,
+        endpoint=False,
+    )
     interp_lats = interpolate_data(times_seconds, lats, interp_times)
     interp_lons = interpolate_data(times_seconds, lons, interp_times)
     interp_eles = interpolate_data(times_seconds, eles, interp_times)
@@ -641,6 +669,12 @@ def create_graph_background_image(
     unit: str,
     base_color,
     text_color,
+    before_range: tuple[int, int] | None = None,
+    clip_range: tuple[int, int] | None = None,
+    after_range: tuple[int, int] | None = None,
+    before_color=None,
+    clip_color=None,
+    after_color=None,
 ) -> Image.Image:
     """Crée une image transparente contenant axes, graduations et courbe complète."""
 
@@ -667,11 +701,29 @@ def create_graph_background_image(
         draw.text((x0 - text_w - 10, y - text_h / 2), val_str, font=font, fill=text_color)
 
     future_color = darken_color(base_color, 0.8)
-    if len(path_coords) >= 2:
-        draw.line(path_coords, fill=future_color, width=4)
-    elif len(path_coords) == 1:
-        cx, cy = path_coords[0]
-        draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
+
+    def _draw_segment(segment_range, color):
+        if not segment_range:
+            return
+        start, end = segment_range
+        start = max(0, min(start, len(path_coords)))
+        end = max(start, min(end, len(path_coords)))
+        if end - start >= 2:
+            draw.line(path_coords[start:end], fill=color, width=4)
+        elif end - start == 1 and start < len(path_coords):
+            cx, cy = path_coords[start]
+            draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=color)
+
+    if before_range or clip_range or after_range:
+        _draw_segment(before_range, before_color or future_color)
+        _draw_segment(clip_range, clip_color or base_color)
+        _draw_segment(after_range, after_color or future_color)
+    else:
+        if len(path_coords) >= 2:
+            draw.line(path_coords, fill=future_color, width=4)
+        elif len(path_coords) == 1:
+            cx, cy = path_coords[0]
+            draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
 
     text_y = y0 + height + 10
     draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
@@ -686,16 +738,24 @@ def draw_graph_progress_overlay(
     current_index: int,
     base_color,
     current_point_color,
-    point_size: int = 4,
+    point_size: int,
+    clip_start_idx: int,
+    clip_end_idx: int,
 ) -> None:
     """Dessine la portion courante et le point actuel sur un graphe pré-dessiné."""
 
     if not path_coords:
         return
 
-    idx = max(0, min(current_index, len(path_coords) - 1))
-    if idx >= 1:
-        draw.line(path_coords[: idx + 1], fill=base_color, width=5)
+    total_points = len(path_coords)
+    clip_start_idx = max(0, min(clip_start_idx, total_points - 1))
+    clip_end_idx = max(clip_start_idx + 1, min(clip_end_idx, total_points))
+    idx = max(clip_start_idx, min(current_index, clip_end_idx - 1))
+
+    if idx >= clip_start_idx and idx < clip_end_idx:
+        segment = path_coords[clip_start_idx : idx + 1]
+        if len(segment) >= 2:
+            draw.line(segment, fill=base_color, width=5)
 
     cx, cy = path_coords[idx]
     draw.ellipse((cx - point_size, cy - point_size, cx + point_size, cy + point_size), fill=current_point_color)
@@ -706,14 +766,21 @@ def prepare_graph_layers(
     font,
     text_color,
     point_color,
-    graph_specs: list[tuple[dict, list[tuple[int, int]], float, float, str, str, tuple[int, int, int]]],
+    graph_specs: list[dict],
 ) -> list[dict]:
     """Prépare les couches de graphes (fond pré-rendu + méta-données)."""
 
     layers: list[dict] = []
-    for area, path_coords, min_val, max_val, title, unit, base_color in graph_specs:
+    for spec in graph_specs:
+        area = spec.get("area", {})
+        path_coords = spec.get("path_coords", [])
         if not is_area_visible(area):
             continue
+        min_val = spec.get("min_val", 0.0)
+        max_val = spec.get("max_val", 1.0)
+        title = spec.get("title", "")
+        unit = spec.get("unit", "")
+        base_color = spec.get("base_color")
         background = create_graph_background_image(
             resolution,
             path_coords,
@@ -725,6 +792,12 @@ def prepare_graph_layers(
             unit,
             base_color,
             text_color,
+            before_range=spec.get("before_range"),
+            clip_range=spec.get("clip_range"),
+            after_range=spec.get("after_range"),
+            before_color=spec.get("before_color"),
+            clip_color=spec.get("clip_color"),
+            after_color=spec.get("after_color"),
         )
         layers.append(
             {
@@ -734,10 +807,12 @@ def prepare_graph_layers(
                 "max": max_val,
                 "title": title,
                 "unit": unit,
-                "base_color": base_color,
+                "base_color": spec.get("progress_color", base_color),
                 "point_color": point_color,
                 "background": background,
-                "point_size": 4,
+                "point_size": spec.get("point_size", 4),
+                "clip_start_idx": spec.get("clip_start_idx", 0),
+                "clip_end_idx": spec.get("clip_end_idx", len(path_coords)),
             }
         )
     return layers
@@ -1156,6 +1231,8 @@ def generate_gpx_video(
     zoom_level_ui: int = 8,      # 1..12 (8 = ajusté)
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
     progress_callback=None,
+    pre_window_seconds: int = 0,
+    post_window_seconds: int = 0,
 ) -> bool:
     # --- Config interne ---
     PATCH_FACTOR = 2.4
@@ -1185,7 +1262,20 @@ def generate_gpx_video(
     text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
     gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
     compass_area = element_configs.get("Boussole (ruban)", {})
+    compass_area = element_configs.get("Boussole (ruban)", {})
 
+    map_before_c = lighten_color(map_path_c, 1.15)
+    map_after_c = darken_color(map_path_c, 0.6)
+    map_clip_future_c = darken_color(map_current_path_c, 0.65)
+
+    pre_window_seconds = max(0, int(pre_window_seconds))
+    post_window_seconds = max(0, int(post_window_seconds))
+    clip_duration = float(clip_duration)
+    clip_frame_count = max(1, int(round(clip_duration * fps)))
+    display_duration = clip_duration + pre_window_seconds + post_window_seconds
+    if display_duration <= 0:
+        print("Durée d'affichage invalide.")
+        return False
 
     # GPX
     points, gpx_start, _ = parse_gpx(gpx_filename)
@@ -1198,7 +1288,14 @@ def generate_gpx_video(
         tz = "Europe/Paris"
         start_time = gpx_start + timedelta(seconds=start_offset)
         start_str = start_time.astimezone(pytz.timezone(tz)).replace(tzinfo=None).isoformat()
-        filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz)
+        filtered_points, start_time, tz = filter_points_by_time(
+            points,
+            start_str,
+            clip_duration,
+            tz,
+            before_seconds=pre_window_seconds,
+            after_seconds=post_window_seconds,
+        )
     except ValueError as e:
         print(f"Erreur: {e}")
         return False
@@ -1207,9 +1304,12 @@ def generate_gpx_video(
     lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
     lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
     eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
+    hrs_raw = np.array([(pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points], dtype=float)
 
-
+    clip_mask = (times_seconds >= -1e-6) & (times_seconds <= clip_duration + 1e-6)
+    if int(np.count_nonzero(clip_mask)) < 2:
+        print("Pas assez de points GPX pour la durée du clip spécifiée.")
+        return False
 
     data = prepare_track_arrays(
         times_seconds,
@@ -1217,30 +1317,12 @@ def generate_gpx_video(
         lons,
         eles,
         hrs_raw,
-        clip_duration,
+        display_duration,
         fps,
         smoothing_seconds,
+        start_offset=-float(pre_window_seconds),
     )
-
-    total_frames = data["total_frames"]
-
-    print(f"Génération de {total_frames} images…")
-    t0 = time.time()
-    report_every = max(1, int(fps))  # ~1 update/s
-
-    def _progress(done: int):
-        pct = int(done * 100 / total_frames) if total_frames else 100
-        if progress_callback:
-            progress_callback(pct)
-        elif done == total_frames or (done % report_every == 0):
-            elapsed = time.time() - t0
-            fps_eff = (done / elapsed) if elapsed > 0 else 0.0
-            eta = (total_frames - done) / fps_eff if fps_eff > 0 else 0.0
-            sys.stdout.write(
-                f"\rFrames {done}/{total_frames}  | {pct}%  | {fps_eff:.1f} fps  | ETA {eta:0.0f}s"
-            )
-            sys.stdout.flush()
-
+    display_total_frames = data["total_frames"]
     interp_times = data["interp_times"]
     interp_lats = data["interp_lats"]
     interp_lons = data["interp_lons"]
@@ -1250,17 +1332,22 @@ def generate_gpx_video(
     interp_pace = data["interp_pace"]
     interp_hrs = data["interp_hrs"]
 
+    clip_start_index = int(np.searchsorted(interp_times, 0.0, side="left"))
+    clip_end_index = min(display_total_frames, clip_start_index + clip_frame_count)
+    clip_frame_count = max(0, clip_end_index - clip_start_index)
+    if clip_frame_count <= 0:
+        print("Plage de clip invalide après extension avant/après.")
+        return False
 
-    # Zones UI
     map_area = element_configs.get("Carte", {})
     elev_area = element_configs.get("Profil Altitude", {})
     speed_area = element_configs.get("Profil Vitesse", {})
-    pace_area  = element_configs.get("Profil Allure", {})
-    hr_area    = element_configs.get("Profil Cardio", {})
+    pace_area = element_configs.get("Profil Allure", {})
+    hr_area = element_configs.get("Profil Cardio", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
-    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
-    info_area  = element_configs.get("Infos Texte", {})
+    gauge_lin_area = element_configs.get("Jauge Vitesse Linéaire", {})
+    gauge_cnt_area = element_configs.get("Compteur de vitesse", {})
+    info_area = element_configs.get("Infos Texte", {})
 
     mw = int(map_area.get("width", 0))
     mh = int(map_area.get("height", 0))
@@ -1268,13 +1355,13 @@ def generate_gpx_video(
         print("Zone carte non visible ou dimensions nulles.")
         return False
 
-    # BBox brute & centre
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    lat_min_raw = float(np.min(interp_lats))
+    lat_max_raw = float(np.max(interp_lats))
+    lon_min_raw = float(np.min(interp_lons))
+    lon_max_raw = float(np.max(interp_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
-    # Profils (altitude & vitesse)
     elev_min = float(np.min(interp_eles))
     elev_max = float(np.max(interp_eles))
     elev_tf = GraphTransformer(elev_min, elev_max, elev_area)
@@ -1287,10 +1374,8 @@ def generate_gpx_video(
     speed_tf = GraphTransformer(speed_min, speed_max, speed_area)
     speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
 
-    # --- AJOUT : profils Allure & Cardio ---
-
     pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
+    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x": 0, "y": 0, "width": 1, "height": 1})
     pace_path = [
         pace_tf.to_xy(
             i,
@@ -1304,23 +1389,47 @@ def generate_gpx_video(
         for i, val in enumerate(interp_pace)
     ]
 
-
     has_hr = np.isfinite(interp_hrs).sum() >= 1
     if has_hr:
         hr_vals = interp_hrs[np.isfinite(interp_hrs)]
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
+    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x": 0, "y": 0, "width": 1, "height": 1})
     hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
 
+    before_range = (0, clip_start_index)
+    clip_range = (clip_start_index, clip_end_index)
+    after_range = (clip_end_index, len(interp_eles))
+
+    def _graph_spec(area, path, min_val, max_val, title, unit, base_color):
+        return {
+            "area": area,
+            "path_coords": path,
+            "min_val": min_val,
+            "max_val": max_val,
+            "title": title,
+            "unit": unit,
+            "base_color": base_color,
+            "before_range": before_range,
+            "clip_range": clip_range,
+            "after_range": after_range,
+            "before_color": lighten_color(base_color, 1.15),
+            "clip_color": darken_color(base_color, 0.85),
+            "after_color": darken_color(base_color, 0.7),
+            "progress_color": base_color,
+            "clip_start_idx": clip_start_index,
+            "clip_end_idx": clip_end_index,
+        }
+
     graph_specs = [
-        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
-        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
-        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
+        _graph_spec(elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
+        _graph_spec(speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
+        _graph_spec(pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
     ]
     if has_hr:
-        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+        graph_specs.append(_graph_spec(hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+
     graph_layers = prepare_graph_layers(
         resolution,
         font_graph,
@@ -1330,36 +1439,33 @@ def generate_gpx_video(
     )
 
     try:
-
         writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
 
-        # Calcul du zoom de base (sur grande image), avec offset UI
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
         est_h = int(min(MAX_LARGE_DIM, mh * 6))
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
         zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
 
-        # Positions "monde" au zoom choisi
         xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
-        # Etendue, marge et image "large"
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-        track_w = x_max - x_min; track_h = y_max - y_min
+        x_min = float(np.min(xs_world))
+        x_max = float(np.max(xs_world))
+        y_min = float(np.min(ys_world))
+        y_max = float(np.max(ys_world))
+        track_w = x_max - x_min
+        track_h = y_max - y_min
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
         margin_x = patch_w // 2 + 64
         margin_y = patch_h // 2 + 64
-        width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
         height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
 
-        # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
         cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
         x0_world = cx - width_large / 2.0
         y0_world = cy - height_large / 2.0
 
-        # Fond "large"
         try:
             base_map_img_large = render_base_map(
                 width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
@@ -1368,33 +1474,31 @@ def generate_gpx_video(
             print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-        # Trace dans le repère "large"
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
         local_xy_buffer = np.empty_like(global_xy)
 
-        # Tête lissée (pour rotation)
-        if total_frames == 0:
+        if display_total_frames == 0:
             smoothed_angles = np.zeros(0, dtype=float)
         else:
-            dx = np.zeros(total_frames, dtype=float)
-            dy = np.zeros(total_frames, dtype=float)
-            if total_frames > 1:
+            dx = np.zeros(display_total_frames, dtype=float)
+            dy = np.zeros(display_total_frames, dtype=float)
+            if display_total_frames > 1:
                 dx[:-1] = np.diff(x_full)
                 dy[:-1] = np.diff(y_full)
                 dx[-1] = x_full[-1] - x_full[-2]
                 dy[-1] = y_full[-1] - y_full[-2]
-            headings = np.zeros(total_frames, dtype=float)
+            headings = np.zeros(display_total_frames, dtype=float)
             non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
             headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
 
             complex_raw = np.exp(1j * headings)
             win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
             half_windows = win_sizes // 2
-            indices = np.arange(total_frames)
+            indices = np.arange(display_total_frames)
             start_idx = np.maximum(indices - half_windows, 0)
-            end_idx = np.minimum(indices + half_windows + 1, total_frames)
+            end_idx = np.minimum(indices + half_windows + 1, display_total_frames)
 
             cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
             counts = (end_idx - start_idx).astype(float)
@@ -1402,43 +1506,57 @@ def generate_gpx_video(
             averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
             smoothed_angles = np.arctan2(averages.imag, averages.real)
 
-        # Rendu images -> flux vidéo
-        last_heading_deg = math.degrees(smoothed_angles[0]) if total_frames else 0.0
+        last_heading_deg = math.degrees(smoothed_angles[clip_start_index]) if display_total_frames else 0.0
 
-        for frame_idx in range(total_frames):
+        for frame_idx in range(clip_frame_count):
+            display_idx = clip_start_index + frame_idx
             frame_img = Image.new("RGB", resolution, bg_c)
             draw = ImageDraw.Draw(frame_img)
 
-            # Patch centré sur le point courant
-            xc = float(x_full[frame_idx]); yc = float(y_full[frame_idx])
+            xc = float(x_full[display_idx])
+            yc = float(y_full[display_idx])
             patch_left = int(round(xc - patch_w / 2.0))
-            patch_top  = int(round(yc - patch_h / 2.0))
+            patch_top = int(round(yc - patch_h / 2.0))
             patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
 
-            src_left   = max(0, patch_left)
-            src_top    = max(0, patch_top)
-            src_right  = min(base_map_img_large.width,  patch_left + patch_w)
-            src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
+            src_left = max(0, patch_left)
+            src_top = max(0, patch_top)
+            src_right = min(base_map_img_large.width, patch_left + patch_w)
+            src_bottom = min(base_map_img_large.height, patch_top + patch_h)
             if src_right > src_left and src_bottom > src_top:
                 crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
                 dest_x = src_left - patch_left
-                dest_y = src_top  - patch_top
+                dest_y = src_top - patch_top
                 patch_img.paste(crop, (dest_x, dest_y))
 
-            # Trace + progression + point (dans le patch)
             pdraw = ImageDraw.Draw(patch_img)
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
             local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
-            pdraw.line(local_xy_list[: frame_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy_buffer[frame_idx]
+
+            def _draw_map_segment(segment_range, color, width=3):
+                s, e = segment_range
+                s = max(0, min(s, len(local_xy_list)))
+                e = max(s, min(e, len(local_xy_list)))
+                if e - s >= 2:
+                    pdraw.line(local_xy_list[s:e], fill=color, width=width)
+                elif e - s == 1 and s < len(local_xy_list):
+                    xpt, ypt = local_xy_list[s]
+                    pdraw.ellipse((xpt - 1, ypt - 1, xpt + 1, ypt + 1), fill=color)
+
+            _draw_map_segment(before_range, map_before_c)
+            _draw_map_segment(clip_range, map_clip_future_c)
+            _draw_map_segment(after_range, map_after_c)
+
+            progress_range = (clip_start_index, clip_start_index + frame_idx + 1)
+            _draw_map_segment(progress_range, map_current_path_c, width=4)
+
+            cxp, cyp = local_xy_buffer[display_idx]
             r = 6
             pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
-            # Rotation patch (cadre fixe)
-            speed_kmh = float(interp_speeds[frame_idx])
-            desired_heading = math.degrees(smoothed_angles[frame_idx])
+            speed_kmh = float(interp_speeds[display_idx])
+            desired_heading = math.degrees(smoothed_angles[display_idx])
             if speed_kmh >= 4.0:
                 diff = ((desired_heading - last_heading_deg + 180) % 360) - 180
                 last_heading_deg += 0.1 * diff
@@ -1450,32 +1568,31 @@ def generate_gpx_video(
                 center=(patch_w / 2.0, patch_h / 2.0),
             )
 
-            # Recadrage EXACT viewport
             view_left = int(round(patch_w / 2.0 - mw / 2.0))
-            view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+            view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
             view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
-            # Collage final
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
-            # Profils & infos
             for layer in graph_layers:
                 frame_img.paste(layer["background"], (0, 0), layer["background"])
             for layer in graph_layers:
                 draw_graph_progress_overlay(
                     draw,
                     layer["path"],
-                    frame_idx,
+                    display_idx,
                     layer["base_color"],
                     layer["point_color"],
                     layer["point_size"],
+                    layer["clip_start_idx"],
+                    layer["clip_end_idx"],
                 )
 
             if gauge_circ_area.get("visible", False):
                 draw_circular_speedometer(
                     draw,
-                    float(interp_speeds[frame_idx]),
+                    float(interp_speeds[display_idx]),
                     speed_min,
                     speed_max,
                     gauge_circ_area,
@@ -1486,7 +1603,7 @@ def generate_gpx_video(
             if gauge_lin_area.get("visible", False):
                 draw_linear_speedometer(
                     draw,
-                    float(interp_speeds[frame_idx]),
+                    float(interp_speeds[display_idx]),
                     speed_min,
                     speed_max,
                     gauge_lin_area,
@@ -1497,7 +1614,7 @@ def generate_gpx_video(
             if gauge_cnt_area.get("visible", False):
                 draw_digital_speedometer(
                     draw,
-                    float(interp_speeds[frame_idx]),
+                    float(interp_speeds[display_idx]),
                     speed_min,
                     speed_max,
                     gauge_cnt_area,
@@ -1505,25 +1622,28 @@ def generate_gpx_video(
                     gauge_bg_c,
                     text_c,
                 )
-            # Boussole : cap courant
             if compass_area.get("visible", False):
                 draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
             if info_area.get("visible", False):
-                draw_info_text(draw,
-                               float(interp_speeds[frame_idx]),
-                               float(interp_eles[frame_idx]),
-                               float(interp_slopes[frame_idx]),
-                               start_time + timedelta(seconds=float(interp_times[frame_idx])),
-                               info_area, font_medium, tz, text_c)
-                # --- Texte Allure & FC supplémentaires ---
-                pace_now = float(interp_pace[frame_idx])
-                hr_now = float(interp_hrs[frame_idx]) if np.isfinite(interp_hrs[frame_idx]) else None
+                draw_info_text(
+                    draw,
+                    float(interp_speeds[display_idx]),
+                    float(interp_eles[display_idx]),
+                    float(interp_slopes[display_idx]),
+                    start_time + timedelta(seconds=float(interp_times[display_idx])),
+                    info_area,
+                    font_medium,
+                    tz,
+                    text_c,
+                )
+                pace_now = float(interp_pace[display_idx])
+                hr_now = float(interp_hrs[display_idx]) if np.isfinite(interp_hrs[display_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
             writer.append_data(np.array(frame_img))
-            _progress(frame_idx + 1)
-
+            if progress_callback:
+                progress_callback(int((frame_idx + 1) * 100 / clip_frame_count))
 
         writer.close()
         print("Vidéo générée avec succès!")
@@ -1532,16 +1652,6 @@ def generate_gpx_video(
     except Exception as e:
         print(f"Erreur écriture vidéo: {e}")
         return False
-
-
-
-
-# ---------- UI Tkinter ----------
-
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk, colorchooser
-
-# ---------- Aperçu "1re frame" fidèle (mêmes paramètres que la vidéo) ----------
 def render_first_frame_image(
     gpx_filename: str,
     start_offset: int,
@@ -1554,8 +1664,9 @@ def render_first_frame_image(
     map_style: str = "CyclOSM (FR)",
     zoom_level_ui: int = 8,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
+    pre_window_seconds: int = 0,
+    post_window_seconds: int = 0,
 ):
-    # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
     VERTICAL_BIAS = 0.65
@@ -1582,6 +1693,18 @@ def render_first_frame_image(
     text_c = (color_configs.get("text", TEXT_COLOR) if color_configs else TEXT_COLOR)
     gauge_bg_c = (color_configs.get("gauge_background", GAUGE_BG_COLOR) if color_configs else GAUGE_BG_COLOR)
 
+    map_before_c = lighten_color(map_path_c, 1.15)
+    map_after_c = darken_color(map_path_c, 0.6)
+    map_clip_future_c = darken_color(map_current_path_c, 0.65)
+
+    pre_window_seconds = max(0, int(pre_window_seconds))
+    post_window_seconds = max(0, int(post_window_seconds))
+    clip_duration = float(clip_duration)
+    clip_frame_count = max(1, int(round(clip_duration * fps)))
+    display_duration = clip_duration + pre_window_seconds + post_window_seconds
+    if display_duration <= 0:
+        raise ValueError("Durée d'affichage invalide.")
+
     points, gpx_start, _ = parse_gpx(gpx_filename)
     if not points:
         raise ValueError("Aucun point GPX.")
@@ -1590,13 +1713,24 @@ def render_first_frame_image(
     tz_str = "Europe/Paris"
     start_time = gpx_start + timedelta(seconds=start_offset)
     start_str = start_time.astimezone(pytz.timezone(tz_str)).replace(tzinfo=None).isoformat()
-    filtered_points, start_time, tz = filter_points_by_time(points, start_str, clip_duration, tz_str)
+    filtered_points, start_time, tz = filter_points_by_time(
+        points,
+        start_str,
+        clip_duration,
+        tz_str,
+        before_seconds=pre_window_seconds,
+        after_seconds=post_window_seconds,
+    )
 
     times = np.array([(pt["time"] - start_time).total_seconds() for pt in filtered_points], dtype=float)
     lats = np.array([pt["lat"] for pt in filtered_points], dtype=float)
     lons = np.array([pt["lon"] for pt in filtered_points], dtype=float)
     eles = np.array([pt["ele"] for pt in filtered_points], dtype=float)
-    hrs_raw = np.array([ (pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points ], dtype=float)
+    hrs_raw = np.array([(pt.get("hr") if pt.get("hr") is not None else np.nan) for pt in filtered_points], dtype=float)
+
+    clip_mask = (times >= -1e-6) & (times <= clip_duration + 1e-6)
+    if int(np.count_nonzero(clip_mask)) < 2:
+        raise ValueError("Pas assez de points GPX pour la durée du clip spécifiée.")
 
     data = prepare_track_arrays(
         times,
@@ -1604,11 +1738,12 @@ def render_first_frame_image(
         lons,
         eles,
         hrs_raw,
-        clip_duration,
+        display_duration,
         fps,
         smoothing_seconds,
+        start_offset=-float(pre_window_seconds),
     )
-    total_frames = data["total_frames"]
+    display_total_frames = data["total_frames"]
     interp_times = data["interp_times"]
     interp_lats = data["interp_lats"]
     interp_lons = data["interp_lons"]
@@ -1618,25 +1753,31 @@ def render_first_frame_image(
     interp_pace = data["interp_pace"]
     interp_hrs = data["interp_hrs"]
 
+    clip_start_index = int(np.searchsorted(interp_times, 0.0, side="left"))
+    clip_end_index = min(display_total_frames, clip_start_index + clip_frame_count)
+    if clip_end_index - clip_start_index <= 0:
+        raise ValueError("Plage de clip invalide après extension avant/après.")
+    display_idx = clip_start_index
 
     map_area = element_configs.get("Carte", {})
     elev_area = element_configs.get("Profil Altitude", {})
     speed_area = element_configs.get("Profil Vitesse", {})
-    pace_area  = element_configs.get("Profil Allure", {})
-    hr_area    = element_configs.get("Profil Cardio", {})
+    pace_area = element_configs.get("Profil Allure", {})
+    hr_area = element_configs.get("Profil Cardio", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
-    gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
-    gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
-    info_area  = element_configs.get("Infos Texte", {})
-    compass_area = element_configs.get("Boussole (ruban)", {})
+    gauge_lin_area = element_configs.get("Jauge Vitesse Linéaire", {})
+    gauge_cnt_area = element_configs.get("Compteur de vitesse", {})
+    info_area = element_configs.get("Infos Texte", {})
 
-
-    mw = int(map_area.get("width", 0)); mh = int(map_area.get("height", 0))
+    mw = int(map_area.get("width", 0))
+    mh = int(map_area.get("height", 0))
     if not map_area.get("visible", False) or mw <= 0 or mh <= 0:
         raise ValueError("Zone carte non visible ou dimensions nulles.")
 
-    lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
-    lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
+    lat_min_raw = float(np.min(interp_lats))
+    lat_max_raw = float(np.max(interp_lats))
+    lon_min_raw = float(np.min(interp_lons))
+    lon_max_raw = float(np.max(interp_lons))
     lat_c = (lat_min_raw + lat_max_raw) * 0.5
     lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
@@ -1653,7 +1794,7 @@ def render_first_frame_image(
     speed_path = [speed_tf.to_xy(i, val, len(interp_speeds)) for i, val in enumerate(interp_speeds)]
 
     pace_min, pace_max = PACE_GRAPH_MIN, PACE_GRAPH_MAX
-    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x":0,"y":0,"width":1,"height":1})
+    pace_tf = GraphTransformer(pace_min, pace_max, pace_area if pace_area else {"x": 0, "y": 0, "width": 1, "height": 1})
     pace_path = [
         pace_tf.to_xy(
             i,
@@ -1673,16 +1814,41 @@ def render_first_frame_image(
         hr_min, hr_max = float(np.min(hr_vals)), float(np.max(hr_vals))
     else:
         hr_min, hr_max = 0.0, 1.0
-    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x":0,"y":0,"width":1,"height":1})
+    hr_tf = GraphTransformer(hr_min, hr_max if hr_max > hr_min else (hr_min + 1.0), hr_area if hr_area else {"x": 0, "y": 0, "width": 1, "height": 1})
     hr_path = [hr_tf.to_xy(i, (val if np.isfinite(val) else hr_min), len(interp_hrs)) for i, val in enumerate(interp_hrs)]
 
+    before_range = (0, clip_start_index)
+    clip_range = (clip_start_index, clip_end_index)
+    after_range = (clip_end_index, len(interp_eles))
+
+    def _graph_spec(area, path, min_val, max_val, title, unit, base_color):
+        return {
+            "area": area,
+            "path_coords": path,
+            "min_val": min_val,
+            "max_val": max_val,
+            "title": title,
+            "unit": unit,
+            "base_color": base_color,
+            "before_range": before_range,
+            "clip_range": clip_range,
+            "after_range": after_range,
+            "before_color": lighten_color(base_color, 1.15),
+            "clip_color": darken_color(base_color, 0.85),
+            "after_color": darken_color(base_color, 0.7),
+            "progress_color": base_color,
+            "clip_start_idx": clip_start_index,
+            "clip_end_idx": clip_end_index,
+        }
+
     graph_specs = [
-        (elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
-        (speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
-        (pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
+        _graph_spec(elev_area, elev_path, elev_min, elev_max, "Altitude", "m", alt_path_c),
+        _graph_spec(speed_area, speed_path, speed_min_val, speed_max_val, "Vitesse", "km/h", speed_path_c),
+        _graph_spec(pace_area, pace_path, pace_min, pace_max, "Allure", "min/km", pace_path_c),
     ]
     if has_hr:
-        graph_specs.append((hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+        graph_specs.append(_graph_spec(hr_area, hr_path, hr_min, hr_max, "FC", "bpm", hr_path_c))
+
     graph_layers = prepare_graph_layers(
         resolution,
         font_graph,
@@ -1693,112 +1859,125 @@ def render_first_frame_image(
 
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
-    frame_idx = 0
-    heading_deg = 0.0
+
+    est_w = int(min(MAX_LARGE_DIM, mw * 6))
+    est_h = int(min(MAX_LARGE_DIM, mh * 6))
+    base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
+    zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+
+    xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
+    x_min = float(np.min(xs_world))
+    x_max = float(np.max(xs_world))
+    y_min = float(np.min(ys_world))
+    y_max = float(np.max(ys_world))
+    track_w = x_max - x_min
+    track_h = y_max - y_min
+
+    patch_w = int(math.ceil(mw * PATCH_FACTOR))
+    patch_h = int(math.ceil(mh * PATCH_FACTOR))
+    margin_x = patch_w // 2 + 64
+    margin_y = patch_h // 2 + 64
+    width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
+    height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
+
+    cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
+    x0_world = cx - width_large / 2.0
+    y0_world = cy - height_large / 2.0
 
     try:
-        est_w = int(min(MAX_LARGE_DIM, mw * 6))
-        est_h = int(min(MAX_LARGE_DIM, mh * 6))
-        base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
-
-        xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
-
-        x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
-        y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
-        track_w = x_max - x_min; track_h = y_max - y_min
-
-
-        patch_w = int(math.ceil(mw * PATCH_FACTOR))
-        patch_h = int(math.ceil(mh * PATCH_FACTOR))
-        margin_x = patch_w // 2 + 64
-        margin_y = patch_h // 2 + 64
-        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
-
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
-
-        try:
-            base_map_img_large = render_base_map(
-                width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
-            )
-        except Exception:
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
-
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
-
-        headings = []
-        for i in range(total_frames):
-            if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
-            else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
-            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-                headings.append(math.atan2(dx, -dy))
-            else:
-                headings.append(0.0)
-        complex_raw = np.exp(1j * np.array(headings))
-        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-        smoothed_angles = []
-        for idx in range(total_frames):
-            w = int(win_sizes[idx])
-            half_w = w // 2
-            a = max(0, idx - half_w)
-            b = min(total_frames, idx + half_w + 1)
-            avg = np.mean(complex_raw[a:b])
-            smoothed_angles.append(math.atan2(avg.imag, avg.real))
-
-        xc = float(x_full[0])
-        yc = float(y_full[0])
-        patch_left = int(round(xc - patch_w / 2.0))
-        patch_top = int(round(yc - patch_h / 2.0))
-        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
-
-        src_left = max(0, patch_left)
-        src_top = max(0, patch_top)
-        src_right = min(base_map_img_large.width, patch_left + patch_w)
-        src_bottom = min(base_map_img_large.height, patch_top + patch_h)
-        if src_right > src_left and src_bottom > src_top:
-            crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
-            dest_x = src_left - patch_left
-            dest_y = src_top - patch_top
-            patch_img.paste(crop, (dest_x, dest_y))
-
-        pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[:1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[0]
-        r = 6
-        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
-
-        speed_kmh0 = float(interp_speeds[0])
-        heading_deg = 0.0 if speed_kmh0 < 4.0 else math.degrees(smoothed_angles[0])
-        patch_img = patch_img.rotate(
-            heading_deg,
-            resample=Image.BICUBIC,
-            expand=False,
-            center=(patch_w / 2.0, patch_h / 2.0),
+        base_map_img_large = render_base_map(
+            width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
         )
-        view_left = int(round(patch_w / 2.0 - mw / 2.0))
-        view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
-
-        frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
-
-        draw_north_arrow(frame_img, map_area, heading_deg, text_c)
-
     except Exception as e:
-        pass
+        print(f"Fond carte non dispo (aperçu), fond uni utilisé: {e}")
+        base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+
+    x_full = xs_world - x0_world
+    y_full = ys_world - y0_world
+    global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+    local_xy_buffer = np.empty_like(global_xy)
+
+    if display_total_frames == 0:
+        smoothed_angles = np.zeros(0, dtype=float)
+    else:
+        dx = np.zeros(display_total_frames, dtype=float)
+        dy = np.zeros(display_total_frames, dtype=float)
+        if display_total_frames > 1:
+            dx[:-1] = np.diff(x_full)
+            dy[:-1] = np.diff(y_full)
+            dx[-1] = x_full[-1] - x_full[-2]
+            dy[-1] = y_full[-1] - y_full[-2]
+        headings = np.zeros(display_total_frames, dtype=float)
+        non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
+        headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
+
+        complex_raw = np.exp(1j * headings)
+        win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
+        half_windows = win_sizes // 2
+        indices = np.arange(display_total_frames)
+        start_idx = np.maximum(indices - half_windows, 0)
+        end_idx = np.minimum(indices + half_windows + 1, display_total_frames)
+
+        cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
+        counts = (end_idx - start_idx).astype(float)
+        counts[counts == 0] = 1.0
+        averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
+        smoothed_angles = np.arctan2(averages.imag, averages.real)
+
+    xc = float(x_full[display_idx])
+    yc = float(y_full[display_idx])
+    patch_left = int(round(xc - patch_w / 2.0))
+    patch_top = int(round(yc - patch_h / 2.0))
+    patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+
+    src_left = max(0, patch_left)
+    src_top = max(0, patch_top)
+    src_right = min(base_map_img_large.width, patch_left + patch_w)
+    src_bottom = min(base_map_img_large.height, patch_top + patch_h)
+    if src_right > src_left and src_bottom > src_top:
+        crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+        dest_x = src_left - patch_left
+        dest_y = src_top - patch_top
+        patch_img.paste(crop, (dest_x, dest_y))
+
+    pdraw = ImageDraw.Draw(patch_img)
+    np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
+    np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
+    local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+
+    def _draw_map_segment(segment_range, color, width=3):
+        s, e = segment_range
+        s = max(0, min(s, len(local_xy_list)))
+        e = max(s, min(e, len(local_xy_list)))
+        if e - s >= 2:
+            pdraw.line(local_xy_list[s:e], fill=color, width=width)
+        elif e - s == 1 and s < len(local_xy_list):
+            xpt, ypt = local_xy_list[s]
+            pdraw.ellipse((xpt - 1, ypt - 1, xpt + 1, ypt + 1), fill=color)
+
+    _draw_map_segment(before_range, map_before_c)
+    _draw_map_segment(clip_range, map_clip_future_c)
+    _draw_map_segment(after_range, map_after_c)
+    _draw_map_segment((clip_start_index, clip_start_index + 1), map_current_path_c, width=4)
+
+    cxp, cyp = local_xy_buffer[display_idx]
+    r = 6
+    pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+
+    heading_deg = math.degrees(smoothed_angles[display_idx]) if display_total_frames else 0.0
+
+    patch_img = patch_img.rotate(
+        heading_deg,
+        resample=Image.BICUBIC,
+        expand=False,
+        center=(patch_w / 2.0, patch_h / 2.0),
+    )
+    view_left = int(round(patch_w / 2.0 - mw / 2.0))
+    view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+    view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+
+    frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+    draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
     for layer in graph_layers:
         frame_img.paste(layer["background"], (0, 0), layer["background"])
@@ -1806,16 +1985,18 @@ def render_first_frame_image(
         draw_graph_progress_overlay(
             draw,
             layer["path"],
-            0,
+            display_idx,
             layer["base_color"],
             layer["point_color"],
             layer["point_size"],
+            layer["clip_start_idx"],
+            layer["clip_end_idx"],
         )
 
     if gauge_circ_area.get("visible", False):
         draw_circular_speedometer(
             draw,
-            float(interp_speeds[0]),
+            float(interp_speeds[display_idx]),
             speed_min,
             speed_max,
             gauge_circ_area,
@@ -1826,7 +2007,7 @@ def render_first_frame_image(
     if gauge_lin_area.get("visible", False):
         draw_linear_speedometer(
             draw,
-            float(interp_speeds[0]),
+            float(interp_speeds[display_idx]),
             speed_min,
             speed_max,
             gauge_lin_area,
@@ -1837,7 +2018,7 @@ def render_first_frame_image(
     if gauge_cnt_area.get("visible", False):
         draw_digital_speedometer(
             draw,
-            float(interp_speeds[0]),
+            float(interp_speeds[display_idx]),
             speed_min,
             speed_max,
             gauge_cnt_area,
@@ -1848,18 +2029,22 @@ def render_first_frame_image(
     if compass_area.get("visible", False):
         draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
     if info_area.get("visible", False):
-        draw_info_text(draw,
-                       float(interp_speeds[0]),
-                       float(interp_eles[0]),
-                       float(interp_slopes[0]),
-                       start_time + timedelta(seconds=float(interp_times[0])),
-                       info_area, font_medium, tz, text_c)
-        pace_now = float(interp_pace[0])
-        hr_now = float(interp_hrs[0]) if np.isfinite(interp_hrs[0]) else None
+        draw_info_text(
+            draw,
+            float(interp_speeds[display_idx]),
+            float(interp_eles[display_idx]),
+            float(interp_slopes[display_idx]),
+            start_time + timedelta(seconds=float(interp_times[display_idx])),
+            info_area,
+            font_medium,
+            tz,
+            text_c,
+        )
+        pace_now = float(interp_pace[display_idx])
+        hr_now = float(interp_hrs[display_idx]) if np.isfinite(interp_hrs[display_idx]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
     return frame_img
-
 class GPXVideoApp:
     def __init__(self, master):
         self.master = master
@@ -1874,6 +2059,8 @@ class GPXVideoApp:
         self.gpx_start_time_raw = None
         self.gpx_end_time_raw = None
         self.start_offset_var = tk.IntVar(value=0)
+        self.before_window_var = tk.IntVar(value=0)
+        self.after_window_var = tk.IntVar(value=0)
 
         self.element_visibility_vars = {}
         self.element_pos_entries_vars = {}
@@ -2040,6 +2227,38 @@ class GPXVideoApp:
         self.duration_var.trace_add("write", self.on_duration_slider_change)
         self.update_duration_label()
         self.update_clip_time_label()
+
+        ttk.Label(gen_params_frame, text="Temps affiché avant le clip:").pack(fill=tk.X, pady=2)
+        self.before_window_scale = ttk.Scale(
+            gen_params_frame,
+            from_=0,
+            to=0,
+            variable=self.before_window_var,
+            orient=tk.HORIZONTAL,
+        )
+        self.before_window_scale.pack(fill=tk.X, pady=2)
+        self.before_window_label = ttk.Label(gen_params_frame, text="0:00:00")
+        self.before_window_label.pack(fill=tk.X, pady=2)
+        self.before_window_var.trace_add("write", self.on_before_change)
+        self.update_before_label()
+
+        ttk.Label(gen_params_frame, text="Temps affiché après le clip:").pack(fill=tk.X, pady=2)
+        self.after_window_scale = ttk.Scale(
+            gen_params_frame,
+            from_=0,
+            to=0,
+            variable=self.after_window_var,
+            orient=tk.HORIZONTAL,
+        )
+        self.after_window_scale.pack(fill=tk.X, pady=2)
+        self.after_window_label = ttk.Label(gen_params_frame, text="0:00:00")
+        self.after_window_label.pack(fill=tk.X, pady=2)
+        self.after_window_var.trace_add("write", self.on_after_change)
+        self.update_after_label()
+
+        self.display_time_label = ttk.Label(gen_params_frame, text="Fenêtre affichée : N/A")
+        self.display_time_label.pack(fill=tk.X, pady=2)
+        self.update_display_time_label()
 
 
         ttk.Label(gen_params_frame, text="FPS:").pack(fill=tk.X, pady=2)
@@ -2326,6 +2545,7 @@ class GPXVideoApp:
             )
         else:
             self.clip_time_label.config(text="Clip: début N/A - fin N/A")
+        self.update_display_time_label()
 
     def update_start_offset_label(self, *args):
         start = int(self.start_offset_var.get())
@@ -2341,15 +2561,72 @@ class GPXVideoApp:
         dur = int(self.duration_var.get())
         self.duration_label.config(text=format_hms(dur))
 
+    def update_before_label(self, *args):
+        before = int(self.before_window_var.get())
+        self.before_window_label.config(text=format_hms(before))
+
+    def update_after_label(self, *args):
+        after = int(self.after_window_var.get())
+        self.after_window_label.config(text=format_hms(after))
+
+    def update_display_time_label(self, *args):
+        if not self.gpx_start_time_raw:
+            self.display_time_label.config(text="Fenêtre affichée : N/A")
+            return
+        clip_start = self.gpx_start_time_raw + timedelta(seconds=int(self.start_offset_var.get()))
+        before = int(self.before_window_var.get())
+        after = int(self.after_window_var.get())
+        window_start = clip_start - timedelta(seconds=before)
+        window_end = clip_start + timedelta(seconds=int(self.duration_var.get()) + after)
+        self.display_time_label.config(
+            text=f"Fenêtre affichée : {window_start.strftime('%H:%M:%S')} → {window_end.strftime('%H:%M:%S')}"
+        )
+
+    def update_before_max(self, *args):
+        if not self.gpx_start_time_raw:
+            return
+        max_before = int(self.start_offset_var.get())
+        self.before_window_scale.config(to=max_before)
+        if self.before_window_var.get() > max_before:
+            self.before_window_var.set(max_before)
+        self.update_before_label()
+
+    def update_after_max(self, *args):
+        if not (self.gpx_start_time_raw and self.gpx_end_time_raw):
+            return
+        total_sec = int((self.gpx_end_time_raw - self.gpx_start_time_raw).total_seconds())
+        start = int(self.start_offset_var.get())
+        dur = int(self.duration_var.get())
+        max_after = max(0, total_sec - (start + dur))
+        self.after_window_scale.config(to=max_after)
+        if self.after_window_var.get() > max_after:
+            self.after_window_var.set(max_after)
+        self.update_after_label()
+
     def on_start_offset_change(self, *args):
         self.update_start_offset_label()
         self.update_duration_max()
+        self.update_before_max()
+        self.update_after_max()
         self.update_clip_time_label()
+        self.update_display_time_label()
 
     def on_duration_slider_change(self, *args):
         self.update_duration_label()
         self.update_start_offset_max()
+        self.update_after_max()
         self.update_clip_time_label()
+        self.update_display_time_label()
+
+    def on_before_change(self, *args):
+        self.update_before_label()
+        self.update_before_max()
+        self.update_display_time_label()
+
+    def on_after_change(self, *args):
+        self.update_after_label()
+        self.update_after_max()
+        self.update_display_time_label()
 
     def show_preview(self, force_update: bool = False, initial_load: bool = False) -> None:
         if not initial_load and not force_update: return
@@ -2432,6 +2709,8 @@ class GPXVideoApp:
                 map_style=self.map_style_var.get(),
                 zoom_level_ui=int(self.map_zoom_level_var.get()),
                 smoothing_seconds=smoothing_seconds,
+                pre_window_seconds=int(self.before_window_var.get()),
+                post_window_seconds=int(self.after_window_var.get()),
             )
         except Exception as e:
             messagebox.showerror("Erreur", f"Aperçu impossible: {e}")
@@ -2468,10 +2747,14 @@ class GPXVideoApp:
             self.gpx_start_time_raw = start; self.gpx_end_time_raw = end
             base = os.path.basename(filename)
             self.start_offset_var.set(0)
+            self.before_window_var.set(0)
+            self.after_window_var.set(0)
 
             self.update_duration_max()
 
             self.update_start_offset_max()
+            self.update_before_max()
+            self.update_after_max()
         self.gpx_label.config(text=f"Fichier GPX: {base}"); self.gpx_toolbar_label_var.set(f"GPX: {base}")
         tz = pytz.timezone('Europe/Paris')
         self.gpx_start_time_label.config(text=f"Début GPX: {start.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')}" if start else "Début GPX: N/A")
@@ -2568,6 +2851,8 @@ class GPXVideoApp:
                     zoom_level_ui=int(self.map_zoom_level_var.get()),
                     smoothing_seconds=smoothing_seconds,
                     progress_callback=progress_cb,
+                    pre_window_seconds=int(self.before_window_var.get()),
+                    post_window_seconds=int(self.after_window_var.get()),
                 )
             except Exception as e:
                 success = False
