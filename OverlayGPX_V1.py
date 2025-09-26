@@ -1885,6 +1885,11 @@ class GPXVideoApp:
         self.preview_image_tk = None
         self.current_video_resolution = list(DEFAULT_RESOLUTION)
         self._block_recursion = False
+        self.resolution_presets = [
+            ("1080p (1920x1080)", (1920, 1080)),
+            ("4K (3840x2160)", (3840, 2160)),
+        ]
+        self._resolution_lookup = {label: value for label, value in self.resolution_presets}
 
         # Couleurs
         self.color_configs = {}
@@ -1913,7 +1918,6 @@ class GPXVideoApp:
 
         # Validation entrées
         self.vcmd_int = (master.register(self.validate_integer_or_empty), "%P")
-        self.vcmd_res = (master.register(self.validate_resolution_format), "%P")
         self.vcmd_float = (master.register(self.validate_float_or_empty), "%P")
 
         # Style de carte + Zoom (1..12)
@@ -1970,25 +1974,6 @@ class GPXVideoApp:
         try:
             int(value_if_allowed); return True
         except ValueError:
-            return False
-
-    def validate_resolution_format(self, value_if_allowed):
-        if value_if_allowed == "":
-            return True
-        parts = value_if_allowed.split("x")
-        if len(parts) == 1:
-            return self.validate_integer_or_empty(parts[0])
-        elif len(parts) == 2:
-            ok0 = parts[0] == "" or self.validate_integer_or_empty(parts[0])
-            ok1 = parts[1] == "" or self.validate_integer_or_empty(parts[1])
-            if not (ok0 and ok1): return False
-            if parts[0] != "" and parts[1] != "":
-                try:
-                    w = int(parts[0]); h = int(parts[1]); return w >= 0 and h >= 0
-                except ValueError:
-                    return False
-            return True
-        else:
             return False
 
     def validate_float_or_empty(self, value_if_allowed):
@@ -2070,12 +2055,21 @@ class GPXVideoApp:
         )
         self.graph_smoothing_entry.pack(fill=tk.X, pady=2)
 
-        ttk.Label(gen_params_frame, text="Résolution Vidéo (LargeurxHauteur):").pack(fill=tk.X, pady=2)
-        self.resolution_entry_var = tk.StringVar(value=f"{DEFAULT_RESOLUTION[0]}x{DEFAULT_RESOLUTION[1]}")
-        self.resolution_entry = ttk.Entry(gen_params_frame, textvariable=self.resolution_entry_var, validate="key", validatecommand=self.vcmd_res)
-        self.resolution_entry.pack(fill=tk.X, pady=2)
-        self.resolution_entry.bind("<FocusOut>", self.on_resolution_change)
-        self.resolution_entry.bind("<Return>", self.on_resolution_change)
+        ttk.Label(gen_params_frame, text="Résolution Vidéo :").pack(fill=tk.X, pady=2)
+        resolution_labels = [label for label, _ in self.resolution_presets]
+        default_label = next(
+            (label for label, res in self.resolution_presets if res == tuple(self.current_video_resolution)),
+            resolution_labels[0],
+        )
+        self.resolution_choice_var = tk.StringVar(value=default_label)
+        self.resolution_combo = ttk.Combobox(
+            gen_params_frame,
+            textvariable=self.resolution_choice_var,
+            values=resolution_labels,
+            state="readonly",
+        )
+        self.resolution_combo.pack(fill=tk.X, pady=2)
+        self.resolution_combo.bind("<<ComboboxSelected>>", self.on_resolution_selection_change)
 
         ttk.Label(gen_params_frame, text="Police (TTF):").pack(fill=tk.X, pady=2)
         font_frame = ttk.Frame(gen_params_frame)
@@ -2200,19 +2194,65 @@ class GPXVideoApp:
         return value
 
     # ----- Misc UI -----
-    def on_resolution_change(self, event=None):
-        if self._block_recursion: return
-        res_text = self.resolution_entry_var.get()
-        if "x" in res_text:
-            try:
-                w_str, h_str = res_text.split("x"); w = int(w_str); h = int(h_str)
-                if w > 0 and h > 0:
-                    self.current_video_resolution = [w, h]
-                    self.update_all_slider_ranges(); self.show_preview(force_update=True)
-            except Exception:
-                pass
+    def on_resolution_selection_change(self, event=None):
+        if self._block_recursion:
+            return
+        label = self.resolution_choice_var.get()
+        new_resolution = self._resolution_lookup.get(label)
+        if new_resolution:
+            self.set_video_resolution(new_resolution)
+
+    def set_video_resolution(self, new_resolution: tuple[int, int]):
+        old_width, old_height = self.current_video_resolution
+        new_width, new_height = new_resolution
+        if old_width == new_width and old_height == new_height:
+            return
+        scale_x = new_width / old_width if old_width else 1.0
+        scale_y = new_height / old_height if old_height else 1.0
+        self._block_recursion = True
+        try:
+            self.current_video_resolution = [new_width, new_height]
+            self.update_all_slider_ranges()
+            self._scale_layout_for_resolution(scale_x, scale_y)
+        finally:
+            self._block_recursion = False
+        self.show_preview(force_update=True)
+
+    def _scale_layout_for_resolution(self, scale_x: float, scale_y: float) -> None:
+        max_w, max_h = self.current_video_resolution
+        for element_name in self.element_pos_entries_vars:
+            for key in ("x", "y", "width"):
+                entry_var = self.element_pos_entries_vars[element_name][key]
+                try:
+                    current_val = int(entry_var.get())
+                except (ValueError, tk.TclError):
+                    continue
+                if key in ("x", "width"):
+                    scaled = int(round(current_val * scale_x))
+                    max_dim = max_w
+                else:
+                    scaled = int(round(current_val * scale_y))
+                    max_dim = max_h
+                scaled = max(0, min(scaled, max_dim))
+                entry_var.set(str(scaled))
+                self.element_sliders_vars[element_name][key].set(scaled)
+
+            if element_name in self.element_initial_ratios:
+                ratio = self.element_initial_ratios[element_name]
+                try:
+                    w_val = int(self.element_pos_entries_vars[element_name]["width"].get())
+                except (ValueError, tk.TclError):
+                    continue
+                if ratio == float("inf"):
+                    h_val = DEFAULT_ELEMENT_CONFIGS[element_name]["height"]
+                else:
+                    h_val = int(round(w_val * ratio))
+                h_val = max(0, min(h_val, max_h))
+                self.element_calculated_height_labels[element_name].set(str(h_val))
 
     def handle_element_change(self, element_name, key, source="slider"):
+        if self._block_recursion:
+            return
         if source == "slider":
             value = self.element_sliders_vars[element_name][key].get()
             self.element_pos_entries_vars[element_name][key].set(str(int(value)))
