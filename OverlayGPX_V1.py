@@ -1988,11 +1988,28 @@ class GPXVideoApp:
     def __init__(self, master):
         self.master = master
         master.title("Overlay GPX")
-        master.geometry("1800x800")
+        master.geometry("1500x760")
+        master.minsize(1200, 680)
+        self.accent_button_style = "TButton"
         try:
             style = ttk.Style(); style.theme_use("clam")
+            base_bg = "#f4f6fb"
+            accent = "#2f6fed"
+            style.configure("TFrame", background=base_bg)
+            style.configure("TLabel", background=base_bg)
+            style.configure("TLabelframe", background=base_bg)
+            style.configure("TLabelframe.Label", background=base_bg, foreground="#1f2a44")
+            style.configure("Card.TFrame", background="#ffffff", relief="flat")
+            style.configure("Toolbar.TFrame", background=base_bg)
+            style.configure("Accent.TButton", padding=(10, 6), foreground="#ffffff", background=accent)
+            style.map("Accent.TButton", background=[("active", "#244fd2")])
+            style.configure("TNotebook", background=base_bg, padding=(4, 4))
+            style.configure("TNotebook.Tab", padding=(14, 6))
+            style.configure("TButton", padding=(8, 4))
+            self.accent_button_style = "Accent.TButton"
         except Exception:
-            pass
+            style = None
+        self.master.configure(background="#f4f6fb")
 
         self.gpx_file_path = ""
         self.gpx_start_time_raw = None
@@ -2117,89 +2134,129 @@ class GPXVideoApp:
 
     # ----- UI -----
     def create_widgets(self):
-        main_frame = ttk.Frame(self.master)
-        main_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
+        main_frame = ttk.Frame(self.master, padding=(10, 10))
+        main_frame.grid(row=0, column=0, sticky="nsew")
+        self.master.rowconfigure(0, weight=1)
+        self.master.columnconfigure(0, weight=1)
+        main_frame.columnconfigure(0, weight=0)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(1, weight=1)
 
         # Barre d’outils
-        toolbar = ttk.Frame(main_frame); toolbar.pack(fill=tk.X, pady=(0, 8))
-        ttk.Button(toolbar, text="Ouvrir GPX", command=self.select_gpx_file).pack(side=tk.LEFT, padx=2)
-        ttk.Button(toolbar, text="Prévisualiser 1ʳᵉ frame", command=self.preview_first_frame).pack(side=tk.LEFT, padx=2)
-        self.generate_btn = ttk.Button(toolbar, text="Générer Vidéo", command=self.generate_video)
-        self.generate_btn.pack(side=tk.LEFT, padx=2)
-        ttk.Separator(toolbar, orient=tk.VERTICAL).pack(side=tk.LEFT, fill=tk.Y, padx=6)
+        toolbar = ttk.Frame(main_frame, style="Toolbar.TFrame")
+        toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
+        toolbar.columnconfigure(0, weight=0)
+        toolbar.columnconfigure(1, weight=0)
+        ttk.Button(toolbar, text="Ouvrir GPX", command=self.select_gpx_file).grid(row=0, column=0, padx=(0, 6))
+        ttk.Button(toolbar, text="Prévisualiser 1ʳᵉ frame", command=self.preview_first_frame).grid(row=0, column=1, padx=6)
+        self.generate_btn = ttk.Button(toolbar, text="Générer Vidéo", style=self.accent_button_style, command=self.generate_video)
+        self.generate_btn.grid(row=0, column=2, sticky="w", padx=6)
+        ttk.Button(toolbar, text="Aide", command=self.show_help).grid(row=0, column=3, padx=(12, 0))
+        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=4, sticky="ns", padx=12)
         self.gpx_toolbar_label_var = tk.StringVar(value="GPX: aucun")
-        ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var).pack(side=tk.LEFT, padx=6)
+        ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=5, sticky="w")
+        toolbar.columnconfigure(5, weight=1)
 
         self.progress_time_var = tk.StringVar(value=self.progress_message_default)
-        ttk.Label(toolbar, textvariable=self.progress_time_var).pack(side=tk.RIGHT, padx=6)
+        ttk.Label(toolbar, textvariable=self.progress_time_var, anchor="e").grid(row=0, column=6, sticky="e", padx=(12, 0))
 
         # Colonne gauche avec onglets pour condenser l'interface
         config_panel_outer = ttk.Notebook(main_frame); self.config_panel_outer = config_panel_outer
-        config_panel_outer.pack(side=tk.LEFT, fill=tk.Y, expand=False, padx=(0, 10))
+        config_panel_outer.grid(row=1, column=0, sticky="nsw", padx=(0, 12))
 
         gen_params_tab = ttk.Frame(config_panel_outer)
         config_panel_outer.add(gen_params_tab, text="Paramètres")
-        gen_params_frame = ttk.LabelFrame(gen_params_tab, text="Paramètres de génération")
-        gen_params_frame.pack(fill=tk.X, pady=5, anchor="n", padx=5)
+        gen_params_frame = ttk.LabelFrame(gen_params_tab, text="Paramètres de génération", padding=(8, 6))
+        gen_params_frame.pack(fill=tk.BOTH, expand=True, pady=4, padx=6)
+        for col in range(3):
+            gen_params_frame.columnconfigure(col, weight=1 if col == 1 else 0)
 
-        gpx_frame = ttk.Frame(gen_params_frame); gpx_frame.pack(fill=tk.X, pady=5)
-        self.gpx_label = ttk.Label(gpx_frame, text="Fichier GPX: Aucun"); self.gpx_label.pack(side=tk.LEFT, expand=True, fill=tk.X)
+        row = 0
+        ttk.Label(gen_params_frame, text="Fichier GPX:").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.gpx_label = ttk.Label(gen_params_frame, text="Aucun", anchor="w", wraplength=220)
+        self.gpx_label.grid(row=row, column=1, columnspan=2, sticky="ew", pady=(0, 4))
 
-        self.gpx_start_time_label = ttk.Label(gen_params_frame, text="Début GPX: N/A"); self.gpx_start_time_label.pack(fill=tk.X, pady=2)
-        self.gpx_end_time_label = ttk.Label(gen_params_frame, text="Fin GPX: N/A"); self.gpx_end_time_label.pack(fill=tk.X, pady=2)
-        self.gpx_duration_label = ttk.Label(gen_params_frame, text="Durée GPX: N/A")
-        self.gpx_duration_label.pack(fill=tk.X, pady=2)
+        row += 1
+        info_frame = ttk.Frame(gen_params_frame, style="Card.TFrame", padding=(8, 6))
+        info_frame.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        for col in range(3):
+            info_frame.columnconfigure(col, weight=1)
+        self.gpx_start_time_label = ttk.Label(info_frame, text="Début GPX: N/A", anchor="w")
+        self.gpx_start_time_label.grid(row=0, column=0, sticky="w")
+        self.gpx_end_time_label = ttk.Label(info_frame, text="Fin GPX: N/A", anchor="center")
+        self.gpx_end_time_label.grid(row=0, column=1, sticky="ew")
+        self.gpx_duration_label = ttk.Label(info_frame, text="Durée GPX: N/A", anchor="e")
+        self.gpx_duration_label.grid(row=0, column=2, sticky="e")
 
+        def place_slider_row(label_text, scale_attr_name, value_attr_name):
+            nonlocal row
+            row += 1
+            ttk.Label(gen_params_frame, text=label_text).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+            scale_widget = getattr(self, scale_attr_name, None)
+            if scale_widget is None:
+                raise AttributeError(f"Missing attribute {scale_attr_name}")
+            scale_widget.grid(row=row, column=1, sticky="ew", pady=2)
+            value_label = getattr(self, value_attr_name, None)
+            if value_label is None:
+                raise AttributeError(f"Missing attribute {value_attr_name}")
+            value_label.grid(row=row, column=2, sticky="e", padx=(8, 0))
 
-        ttk.Label(gen_params_frame, text="Début du clip:").pack(fill=tk.X, pady=2)
         self.start_offset_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.start_offset_var, orient=tk.HORIZONTAL)
-        self.start_offset_scale.pack(fill=tk.X, pady=2)
-        self.start_offset_label = ttk.Label(gen_params_frame, text="0:00:00")
-        self.start_offset_label.pack(fill=tk.X, pady=2)
+        self.start_offset_label = ttk.Label(gen_params_frame, text="0:00:00", anchor="e")
         self.start_offset_var.trace_add("write", self.on_start_offset_change)
         self.update_start_offset_label()
+        place_slider_row("Début du clip:", "start_offset_scale", "start_offset_label")
 
-        ttk.Label(gen_params_frame, text="Durée du clip:").pack(fill=tk.X, pady=2)
         self.duration_var = tk.IntVar(value=DEFAULT_CLIP_DURATION_SECONDS)
         self.duration_scale = ttk.Scale(gen_params_frame, from_=1, to=1, variable=self.duration_var, orient=tk.HORIZONTAL)
-        self.duration_scale.pack(fill=tk.X, pady=2)
-        self.duration_label = ttk.Label(gen_params_frame, text="0:00:00")
-        self.duration_label.pack(fill=tk.X, pady=2)
+        self.duration_label = ttk.Label(gen_params_frame, text="0:00:00", anchor="e")
+        place_slider_row("Durée du clip:", "duration_scale", "duration_label")
+
+        row += 1
         self.clip_time_label = ttk.Label(gen_params_frame, text="Clip: début N/A - fin N/A")
-        self.clip_time_label.pack(fill=tk.X, pady=2)
-        ttk.Label(gen_params_frame, text="Temps affiché avant le clip (s):").pack(fill=tk.X, pady=2)
+        self.clip_time_label.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+
         self.pre_roll_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.pre_roll_var, orient=tk.HORIZONTAL)
-        self.pre_roll_scale.pack(fill=tk.X, pady=2)
-        self.pre_roll_label = ttk.Label(gen_params_frame, text="0 s")
-        self.pre_roll_label.pack(fill=tk.X, pady=2)
+        self.pre_roll_label = ttk.Label(gen_params_frame, text="0 s", anchor="e")
         self.pre_roll_var.trace_add("write", self.on_pre_roll_change)
-        ttk.Label(gen_params_frame, text="Temps affiché après le clip (s):").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Temps affiché avant le clip (s):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        self.pre_roll_scale.grid(row=row, column=1, sticky="ew", pady=2)
+        self.pre_roll_label.grid(row=row, column=2, sticky="e", padx=(8, 0))
+
         self.post_roll_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.post_roll_var, orient=tk.HORIZONTAL)
-        self.post_roll_scale.pack(fill=tk.X, pady=2)
-        self.post_roll_label = ttk.Label(gen_params_frame, text="0 s")
-        self.post_roll_label.pack(fill=tk.X, pady=2)
+        self.post_roll_label = ttk.Label(gen_params_frame, text="0 s", anchor="e")
         self.post_roll_var.trace_add("write", self.on_post_roll_change)
+        row += 1
+        ttk.Label(gen_params_frame, text="Temps affiché après le clip (s):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        self.post_roll_scale.grid(row=row, column=1, sticky="ew", pady=2)
+        self.post_roll_label.grid(row=row, column=2, sticky="e", padx=(8, 0))
+
+        row += 1
         self.display_time_label = ttk.Label(gen_params_frame, text="Fenêtre affichée: début N/A - fin N/A")
-        self.display_time_label.pack(fill=tk.X, pady=2)
+        self.display_time_label.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
         self.duration_var.trace_add("write", self.on_duration_slider_change)
         self.update_duration_label()
         self.update_clip_time_label()
 
-
-        ttk.Label(gen_params_frame, text="FPS:").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="FPS:").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         self.fps_entry_var = tk.StringVar(value=str(DEFAULT_FPS))
-        self.fps_entry = ttk.Entry(gen_params_frame, textvariable=self.fps_entry_var, validate="key", validatecommand=self.vcmd_int); self.fps_entry.pack(fill=tk.X, pady=2)
+        self.fps_entry = ttk.Entry(gen_params_frame, textvariable=self.fps_entry_var, validate="key", validatecommand=self.vcmd_int)
+        self.fps_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
 
-        ttk.Label(gen_params_frame, text="Intervalle de lissage des données (s):").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Intervalle de lissage des données (s):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         self.graph_smoothing_entry = ttk.Entry(
             gen_params_frame,
             textvariable=self.graph_smoothing_seconds_var,
             validate="key",
             validatecommand=self.vcmd_float,
         )
-        self.graph_smoothing_entry.pack(fill=tk.X, pady=2)
+        self.graph_smoothing_entry.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
 
-        ttk.Label(gen_params_frame, text="Résolution Vidéo :").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Résolution Vidéo :").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         resolution_labels = [label for label, _ in self.resolution_presets]
         default_label = next(
             (label for label, res in self.resolution_presets if res == tuple(self.current_video_resolution)),
@@ -2212,36 +2269,41 @@ class GPXVideoApp:
             values=resolution_labels,
             state="readonly",
         )
-        self.resolution_combo.pack(fill=tk.X, pady=2)
+        self.resolution_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
         self.resolution_combo.bind("<<ComboboxSelected>>", self.on_resolution_selection_change)
-
-        ttk.Label(gen_params_frame, text="Police (TTF):").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Police (TTF):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         font_frame = ttk.Frame(gen_params_frame)
-        font_frame.pack(fill=tk.X, pady=2)
-        ttk.Entry(font_frame, textvariable=self.font_path_var).pack(side=tk.LEFT, fill=tk.X, expand=True)
-        ttk.Button(font_frame, text="Parcourir", command=self.select_font_file).pack(side=tk.LEFT, padx=2)
+        font_frame.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
+        font_frame.columnconfigure(0, weight=1)
+        ttk.Entry(font_frame, textvariable=self.font_path_var).grid(row=0, column=0, sticky="ew")
+        ttk.Button(font_frame, text="Parcourir", command=self.select_font_file).grid(row=0, column=1, padx=(6, 0))
 
-        ttk.Label(gen_params_frame, text="Taille police:").pack(fill=tk.X, pady=2)
-        ttk.Entry(gen_params_frame, textvariable=self.font_size_var, validate="key", validatecommand=self.vcmd_int).pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Taille police:").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Entry(gen_params_frame, textvariable=self.font_size_var, validate="key", validatecommand=self.vcmd_int).grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
 
         # Style de carte
-        ttk.Label(gen_params_frame, text="Style de carte:").pack(fill=tk.X, pady=2)
+        row += 1
+        ttk.Label(gen_params_frame, text="Style de carte:").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         style_choices = list(MAP_TILE_SERVERS.keys())
         self.map_style_combo = ttk.Combobox(gen_params_frame, textvariable=self.map_style_var, values=style_choices, state="readonly")
-        self.map_style_combo.pack(fill=tk.X, pady=2)
+        self.map_style_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
 
         # Zoom 1..12 (combobox) — 8 = “ajusté”
-        ttk.Label(gen_params_frame, text="Zoom (1-Loin à 12-Proche) :").pack(fill=tk.X, pady=(8, 2))
+        row += 1
+        ttk.Label(gen_params_frame, text="Zoom (1-Loin à 12-Proche) :").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(6, 2))
         self.zoom_combo = ttk.Combobox(gen_params_frame, textvariable=self.map_zoom_level_var, state="readonly",
                                        values=[str(i) for i in range(1, 13)])
         self.zoom_combo.set(str(self.map_zoom_level_var.get()))
-        self.zoom_combo.pack(fill=tk.X, pady=2)
+        self.zoom_combo.grid(row=row, column=1, columnspan=2, sticky="ew", pady=2)
         # Disposition des éléments (onglet dédié)
         elements_tab = ttk.Frame(config_panel_outer)
         config_panel_outer.add(elements_tab, text="Disposition")
-        elements_outer_frame = ttk.LabelFrame(elements_tab, text="Disposition des éléments")
-        elements_outer_frame.pack(fill=tk.X, pady=10, anchor="n", padx=5)
-        scrollable_frame_elements = ttk.Frame(elements_outer_frame); scrollable_frame_elements.pack(fill=tk.X, expand=False)
+        elements_outer_frame = ttk.LabelFrame(elements_tab, text="Disposition des éléments", padding=(6, 6))
+        elements_outer_frame.pack(fill=tk.BOTH, expand=True, pady=8, padx=8)
+        scrollable_frame_elements = ttk.Frame(elements_outer_frame)
+        scrollable_frame_elements.pack(fill=tk.BOTH, expand=True)
 
         headers = ["Élément", "Aff.", "X", "Y", "Largeur"]
         for i, _ in enumerate(headers):
@@ -2286,8 +2348,8 @@ class GPXVideoApp:
         # Onglet Couleurs
         colors_tab = ttk.Frame(config_panel_outer)
         config_panel_outer.add(colors_tab, text="Couleurs")
-        colors_outer = ttk.LabelFrame(colors_tab, text="Palette de couleurs")
-        colors_outer.pack(fill=tk.X, pady=10, anchor="n", padx=5)
+        colors_outer = ttk.LabelFrame(colors_tab, text="Palette de couleurs", padding=(6, 6))
+        colors_outer.pack(fill=tk.BOTH, expand=True, pady=8, padx=8)
         self.color_preview_frames = {}
         row = 0
         for key, label_text in self.color_labels.items():
@@ -2301,7 +2363,7 @@ class GPXVideoApp:
             ttk.Button(colors_outer, text="Modifier…", command=make_pick()).grid(row=row, column=2, padx=4, pady=4)
             row += 1
         btns = ttk.Frame(colors_outer)
-        btns.grid(row=row, column=0, columnspan=3, pady=(0, 4))
+        btns.grid(row=row, column=0, columnspan=3, pady=(4, 0))
         def reset_colors():
             for k, rgb in self.default_color_map.items():
                 self.color_configs[k] = rgb_to_hex(rgb)
@@ -2311,11 +2373,24 @@ class GPXVideoApp:
         ttk.Button(btns, text="Réinitialiser", command=reset_colors).pack(side=tk.LEFT)
 
         # Panneau d’aperçu
-        preview_panel_frame = ttk.LabelFrame(main_frame, text="Aperçu de la disposition")
-        preview_panel_frame.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(10, 0))
+        preview_panel_frame = ttk.LabelFrame(main_frame, text="Aperçu de la disposition", padding=(6, 6))
+        preview_panel_frame.grid(row=1, column=1, sticky="nsew")
         self.preview_label = ttk.Label(preview_panel_frame, text="L'aperçu apparaîtra ici.", anchor="center", relief="groove")
-        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        self.preview_label.pack(fill=tk.BOTH, expand=True, padx=6, pady=6)
         self.preview_label.bind("<Configure>", self.on_preview_resize)
+
+    def show_help(self):
+        """Affiche une fenêtre d’aide avec un résumé des fonctionnalités."""
+
+        help_sections = [
+            "Ouvrir GPX : sélectionne le fichier GPX à analyser et met à jour toutes les données disponibles.",
+            "Prévisualiser 1ʳᵉ frame : génère un aperçu statique pour vérifier la mise en page et les couleurs.",
+            "Générer Vidéo : lance le rendu complet de la vidéo avec les paramètres courants.",
+            "Paramètres : ajustez la plage temporelle, la durée du clip, les pré/post-roll ainsi que la résolution et la police.",
+            "Disposition : cochez les éléments à afficher et modifiez leurs positions/largeurs en direct.",
+            "Couleurs : personnalisez chaque couleur de l’overlay et réinitialisez rapidement si nécessaire.",
+        ]
+        messagebox.showinfo("Aide — Overlay GPX", "\n\n".join(help_sections))
 
     def pick_color(self, key, preview_frame=None):
         initial = self.color_configs.get(key, "#FFFFFF")
