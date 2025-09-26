@@ -619,8 +619,17 @@ def draw_graph(
         )
 
     # Légendes min/max (entiers pour rester simple)
-    draw.text((draw_area["x"], draw_area["y"] + draw_area["height"] + 10), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
-    draw.text((draw_area["x"] + draw_area["width"] - 200, draw_area["y"] + draw_area["height"] + 10), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
+    label_min = f"Min {title}: {min_val:.0f} {unit}"
+    label_max = f"Max {title}: {max_val:.0f} {unit}"
+    text_y = draw_area["y"] + draw_area["height"] + 10
+    draw.text((draw_area["x"], text_y), label_min, font=font, fill=text_color)
+    try:
+        max_bbox = draw.textbbox((0, 0), label_max, font=font)
+        max_width = max_bbox[2] - max_bbox[0]
+    except Exception:
+        max_width = 0
+    max_x = draw_area["x"] + draw_area["width"] - max_width
+    draw.text((max_x, text_y), label_max, font=font, fill=text_color)
 
 
 def is_area_visible(area: dict | None) -> bool:
@@ -674,8 +683,15 @@ def create_graph_background_image(
         draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
 
     text_y = y0 + height + 10
-    draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
-    draw.text((x0 + width - 200, text_y), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
+    label_min = f"Min {title}: {min_val:.0f} {unit}"
+    label_max = f"Max {title}: {max_val:.0f} {unit}"
+    draw.text((x0, text_y), label_min, font=font, fill=text_color)
+    try:
+        max_bbox = draw.textbbox((0, 0), label_max, font=font)
+        max_width = max_bbox[2] - max_bbox[0]
+    except Exception:
+        max_width = 0
+    draw.text((x0 + width - max_width, text_y), label_max, font=font, fill=text_color)
 
     return bg_img
 
@@ -990,54 +1006,67 @@ def draw_north_arrow(img, map_area, rotation_deg, color):
     pos_y = map_area["y"] + 10
     img.paste(arrow_img, (int(pos_x), int(pos_y)), arrow_img)
 
-def draw_compass_tape(draw, heading_deg: float, area: dict, font,
-                      text_color,
-                      bg_color=None,
-                      tick_color=(230, 230, 230),
-                      center_color=(255, 80, 80),
-                      stretch_x: float = 2.8,      # étirement horizontal (plus large)
-                      gap_above: int = -220,          # espace entre l'arc et le trait rouge
-                      marker_len: int = 70         # longueur du trait rouge
-                      ):
-    """
-    Demi-rose tournée 90° anti-horaire, TEXTES HORIZONTAUX.
-    - Ellipse élargie via stretch_x (>1).
-    - Ticks: 1°, 5°, 15° (labels tous les 15°).
-    - Marqueur: TRAIT ROUGE vertical juste au-dessus de l'arc (pas de label).
-    """
+def draw_compass_tape(
+    draw,
+    heading_deg: float,
+    area: dict,
+    font,
+    text_color,
+    bg_color=None,
+    tick_color=(230, 230, 230),
+    center_color=(255, 80, 80),
+):
+    """Dessine une boussole ruban entièrement contenue dans ``area``."""
+
     import math
 
-    # ---- Réglages visuels ----
-    total_span_deg = 120.0
-    arc_span_deg   = 120.0
-    arc_width      = 6
-    small_len      = 8
-    mid_len        = 14
-    big_len        = 22
-    label_gap      = 8
-
-    # ---- Zone ----
     x, y, w, h = area["x"], area["y"], area["width"], area["height"]
-    if w <= 0 or h <= 0:
+    if w <= 0 or h <= 0 or w < 10 or h < 10:
         return
 
-    # Centre sous la zone pour courbure vers le haut
+    # ---- Paramètres dimensionnés sur la zone ----
+    margin_x = max(6, int(w * 0.04))
+    margin_top = max(6, int(h * 0.12))
+    margin_bottom = max(10, int(h * 0.34))
+    if margin_top + margin_bottom >= h - 2:
+        margin_bottom = max(4, h - margin_top - 2)
+    arc_width = max(2, int(h * 0.07))
+    small_len = max(3, int(h * 0.05))
+    mid_len = max(small_len + 2, int(h * 0.08))
+    big_len = max(mid_len + 2, int(h * 0.12))
+    label_gap = max(4, int(h * 0.08))
+    marker_len = max(6, int(h * 0.30))
+    total_span_deg = 120.0
+    arc_span_deg = 120.0
+
     cx = x + w / 2.0
-    cy = y + h + 6
+    cy = y + h - margin_bottom
 
-    # Rayon de base puis ellipse (rx, ry)
-    r_base = min(w / 2.0 - 4, h * 1.15)
-    if r_base <= 8:
+    desired_ratio = min(4.5, max(2.0, (w / max(1.0, h)) * 0.5))
+    max_rx = max(12.0, (w / 2.0) - margin_x)
+    max_ry = cy - (y + margin_top)
+    max_ry = min(max_ry, margin_bottom - arc_width)
+    if max_rx <= 8 or max_ry <= 8:
         return
-    rx = r_base * stretch_x
-    ry = r_base
 
-    # Rotation géométrique globale (CCW)
+    ry = max(8.0, min(max_ry, max_rx / desired_ratio))
+    rx = max(12.0, min(max_rx, ry * desired_ratio))
+    r_base = max(1.0, ry)
+
     ROT = -90.0
-
-    # Arc en coordonnées PIL
     arc_start = 180.0 - arc_span_deg / 2.0
-    arc_end   = 180.0 + arc_span_deg / 2.0
+    arc_end = 180.0 + arc_span_deg / 2.0
+
+    # Ajustement du marqueur rouge pour rester dans la zone
+    y_top_arc_outer = (cy - ry) - arc_width * 0.5
+    gap_above = max(4, int(h * 0.08))
+    available_marker = y_top_arc_outer - gap_above - y
+    if available_marker <= 0:
+        return
+    max_marker = max(4, available_marker)
+    marker_len = min(marker_len, max_marker)
+    if marker_len <= 0:
+        marker_len = max_marker
     arc_start_r = arc_start + ROT
     arc_end_r   = arc_end   + ROT
 
@@ -1106,8 +1135,8 @@ def draw_compass_tape(draw, heading_deg: float, area: dict, font,
     # --- TRAIT ROUGE vertical juste au-dessus de l'arc ---
     # Bord supérieur de l'ellipse + demi-épaisseur de trait de l'arc
     y_top_arc_outer = (cy - ry) - arc_width * 0.5
-    y1 = y_top_arc_outer - gap_above           # point le plus proche de l'arc
-    y2 = y1 - marker_len                       # vers le haut
+    y1 = y_top_arc_outer - gap_above
+    y2 = y1 - marker_len if marker_len else y1
     draw.line([(cx, y2), (cx, y1)], fill=center_color, width=4)
 
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
@@ -1885,6 +1914,11 @@ class GPXVideoApp:
         self.preview_image_tk = None
         self.current_video_resolution = list(DEFAULT_RESOLUTION)
         self._block_recursion = False
+        self.resolution_presets = [
+            ("1080p (1920x1080)", (1920, 1080)),
+            ("4K (3840x2160)", (3840, 2160)),
+        ]
+        self._resolution_lookup = {label: value for label, value in self.resolution_presets}
 
         # Couleurs
         self.color_configs = {}
@@ -1913,7 +1947,6 @@ class GPXVideoApp:
 
         # Validation entrées
         self.vcmd_int = (master.register(self.validate_integer_or_empty), "%P")
-        self.vcmd_res = (master.register(self.validate_resolution_format), "%P")
         self.vcmd_float = (master.register(self.validate_float_or_empty), "%P")
 
         # Style de carte + Zoom (1..12)
@@ -1970,25 +2003,6 @@ class GPXVideoApp:
         try:
             int(value_if_allowed); return True
         except ValueError:
-            return False
-
-    def validate_resolution_format(self, value_if_allowed):
-        if value_if_allowed == "":
-            return True
-        parts = value_if_allowed.split("x")
-        if len(parts) == 1:
-            return self.validate_integer_or_empty(parts[0])
-        elif len(parts) == 2:
-            ok0 = parts[0] == "" or self.validate_integer_or_empty(parts[0])
-            ok1 = parts[1] == "" or self.validate_integer_or_empty(parts[1])
-            if not (ok0 and ok1): return False
-            if parts[0] != "" and parts[1] != "":
-                try:
-                    w = int(parts[0]); h = int(parts[1]); return w >= 0 and h >= 0
-                except ValueError:
-                    return False
-            return True
-        else:
             return False
 
     def validate_float_or_empty(self, value_if_allowed):
@@ -2070,12 +2084,21 @@ class GPXVideoApp:
         )
         self.graph_smoothing_entry.pack(fill=tk.X, pady=2)
 
-        ttk.Label(gen_params_frame, text="Résolution Vidéo (LargeurxHauteur):").pack(fill=tk.X, pady=2)
-        self.resolution_entry_var = tk.StringVar(value=f"{DEFAULT_RESOLUTION[0]}x{DEFAULT_RESOLUTION[1]}")
-        self.resolution_entry = ttk.Entry(gen_params_frame, textvariable=self.resolution_entry_var, validate="key", validatecommand=self.vcmd_res)
-        self.resolution_entry.pack(fill=tk.X, pady=2)
-        self.resolution_entry.bind("<FocusOut>", self.on_resolution_change)
-        self.resolution_entry.bind("<Return>", self.on_resolution_change)
+        ttk.Label(gen_params_frame, text="Résolution Vidéo :").pack(fill=tk.X, pady=2)
+        resolution_labels = [label for label, _ in self.resolution_presets]
+        default_label = next(
+            (label for label, res in self.resolution_presets if res == tuple(self.current_video_resolution)),
+            resolution_labels[0],
+        )
+        self.resolution_choice_var = tk.StringVar(value=default_label)
+        self.resolution_combo = ttk.Combobox(
+            gen_params_frame,
+            textvariable=self.resolution_choice_var,
+            values=resolution_labels,
+            state="readonly",
+        )
+        self.resolution_combo.pack(fill=tk.X, pady=2)
+        self.resolution_combo.bind("<<ComboboxSelected>>", self.on_resolution_selection_change)
 
         ttk.Label(gen_params_frame, text="Police (TTF):").pack(fill=tk.X, pady=2)
         font_frame = ttk.Frame(gen_params_frame)
@@ -2200,19 +2223,65 @@ class GPXVideoApp:
         return value
 
     # ----- Misc UI -----
-    def on_resolution_change(self, event=None):
-        if self._block_recursion: return
-        res_text = self.resolution_entry_var.get()
-        if "x" in res_text:
-            try:
-                w_str, h_str = res_text.split("x"); w = int(w_str); h = int(h_str)
-                if w > 0 and h > 0:
-                    self.current_video_resolution = [w, h]
-                    self.update_all_slider_ranges(); self.show_preview(force_update=True)
-            except Exception:
-                pass
+    def on_resolution_selection_change(self, event=None):
+        if self._block_recursion:
+            return
+        label = self.resolution_choice_var.get()
+        new_resolution = self._resolution_lookup.get(label)
+        if new_resolution:
+            self.set_video_resolution(new_resolution)
+
+    def set_video_resolution(self, new_resolution: tuple[int, int]):
+        old_width, old_height = self.current_video_resolution
+        new_width, new_height = new_resolution
+        if old_width == new_width and old_height == new_height:
+            return
+        scale_x = new_width / old_width if old_width else 1.0
+        scale_y = new_height / old_height if old_height else 1.0
+        self._block_recursion = True
+        try:
+            self.current_video_resolution = [new_width, new_height]
+            self.update_all_slider_ranges()
+            self._scale_layout_for_resolution(scale_x, scale_y)
+        finally:
+            self._block_recursion = False
+        self.show_preview(force_update=True)
+
+    def _scale_layout_for_resolution(self, scale_x: float, scale_y: float) -> None:
+        max_w, max_h = self.current_video_resolution
+        for element_name in self.element_pos_entries_vars:
+            for key in ("x", "y", "width"):
+                entry_var = self.element_pos_entries_vars[element_name][key]
+                try:
+                    current_val = int(entry_var.get())
+                except (ValueError, tk.TclError):
+                    continue
+                if key in ("x", "width"):
+                    scaled = int(round(current_val * scale_x))
+                    max_dim = max_w
+                else:
+                    scaled = int(round(current_val * scale_y))
+                    max_dim = max_h
+                scaled = max(0, min(scaled, max_dim))
+                entry_var.set(str(scaled))
+                self.element_sliders_vars[element_name][key].set(scaled)
+
+            if element_name in self.element_initial_ratios:
+                ratio = self.element_initial_ratios[element_name]
+                try:
+                    w_val = int(self.element_pos_entries_vars[element_name]["width"].get())
+                except (ValueError, tk.TclError):
+                    continue
+                if ratio == float("inf"):
+                    h_val = DEFAULT_ELEMENT_CONFIGS[element_name]["height"]
+                else:
+                    h_val = int(round(w_val * ratio))
+                h_val = max(0, min(h_val, max_h))
+                self.element_calculated_height_labels[element_name].set(str(h_val))
 
     def handle_element_change(self, element_name, key, source="slider"):
+        if self._block_recursion:
+            return
         if source == "slider":
             value = self.element_sliders_vars[element_name][key].get()
             self.element_pos_entries_vars[element_name][key].set(str(int(value)))
