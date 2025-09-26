@@ -56,8 +56,8 @@ DEFAULT_CLIP_DURATION_SECONDS = 5
 
 # Couleurs par défaut
 BG_COLOR = (0, 0, 0)
-PATH_COLOR = (200, 200, 200)
-CURRENT_PATH_COLOR = (255, 255, 255)
+PATH_COLOR = (196, 152, 29)
+CURRENT_PATH_COLOR = (240, 179, 10)
 CURRENT_POINT_COLOR = (255, 0, 0)
 TEXT_COLOR = (255, 255, 255)
 GAUGE_BG_COLOR = (30, 30, 30)
@@ -2046,7 +2046,7 @@ class GPXVideoApp:
         self.fps_entry_var = tk.StringVar(value=str(DEFAULT_FPS))
         self.fps_entry = ttk.Entry(gen_params_frame, textvariable=self.fps_entry_var, validate="key", validatecommand=self.vcmd_int); self.fps_entry.pack(fill=tk.X, pady=2)
 
-        ttk.Label(gen_params_frame, text="Lissage graphes (s):").pack(fill=tk.X, pady=2)
+        ttk.Label(gen_params_frame, text="Intervalle de lissage des données (s):").pack(fill=tk.X, pady=2)
         self.graph_smoothing_entry = ttk.Entry(
             gen_params_frame,
             textvariable=self.graph_smoothing_seconds_var,
