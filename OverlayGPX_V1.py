@@ -2,6 +2,7 @@
 # GPX -> Vidéo avec carte fond (StaticMap), zoom 1..12 avec centre/zoom explicites,
 # emprise large fiable (WebMercator), durée par défaut 20s.
 
+import json
 import math
 import os
 from datetime import datetime, timedelta
@@ -2372,6 +2373,21 @@ class GPXVideoApp:
             self.show_preview(force_update=True)
         ttk.Button(btns, text="Réinitialiser", command=reset_colors).pack(side=tk.LEFT)
 
+        presets_frame = ttk.LabelFrame(main_frame, text="Presets disposition & couleurs", padding=(6, 6))
+        presets_frame.grid(row=2, column=0, sticky="ew", padx=(0, 12), pady=(8, 0))
+        presets_frame.columnconfigure(0, weight=1)
+        presets_frame.columnconfigure(1, weight=1)
+        ttk.Button(
+            presets_frame,
+            text="Enregistrer preset…",
+            command=self.save_configuration_preset,
+        ).grid(row=0, column=0, padx=4, pady=2, sticky="ew")
+        ttk.Button(
+            presets_frame,
+            text="Charger preset…",
+            command=self.load_configuration_preset,
+        ).grid(row=0, column=1, padx=4, pady=2, sticky="ew")
+
         # Panneau d’aperçu
         preview_panel_frame = ttk.LabelFrame(main_frame, text="Aperçu de la disposition", padding=(6, 6))
         preview_panel_frame.grid(row=1, column=1, sticky="nsew")
@@ -2399,6 +2415,175 @@ class GPXVideoApp:
             self.color_configs[key] = color_code
             if preview_frame is not None: preview_frame.config(background=color_code)
             self.show_preview(force_update=True)
+
+    def _collect_current_configuration(self) -> dict:
+        element_configs = {}
+        for name in DEFAULT_ELEMENT_CONFIGS.keys():
+            height_var = self.element_calculated_height_labels.get(name)
+            try:
+                height_val = int(height_var.get()) if height_var and height_var.get() else DEFAULT_ELEMENT_CONFIGS[name]["height"]
+            except (ValueError, tk.TclError):
+                height_val = DEFAULT_ELEMENT_CONFIGS[name]["height"]
+
+            visibility_var = self.element_visibility_vars.get(name)
+            visible = bool(visibility_var.get()) if visibility_var is not None else DEFAULT_ELEMENT_CONFIGS[name]["visible"]
+
+            def _safe_entry_value(key: str) -> int:
+                entry_var = self.element_pos_entries_vars.get(name, {}).get(key)
+                if entry_var is None:
+                    return DEFAULT_ELEMENT_CONFIGS[name][key]
+                try:
+                    return int(entry_var.get())
+                except (ValueError, tk.TclError):
+                    return DEFAULT_ELEMENT_CONFIGS[name][key]
+
+            element_configs[name] = {
+                "visible": visible,
+                "x": _safe_entry_value("x"),
+                "y": _safe_entry_value("y"),
+                "width": _safe_entry_value("width"),
+                "height": height_val,
+            }
+
+        colors = {key: rgb_to_hex(value) for key, value in self.color_configs.items()}
+
+        return {
+            "version": 1,
+            "saved_at": datetime.utcnow().isoformat() + "Z",
+            "resolution": list(self.current_video_resolution),
+            "map_style": self.map_style_var.get(),
+            "zoom_level": int(self.map_zoom_level_var.get()),
+            "elements": element_configs,
+            "colors": colors,
+        }
+
+    def _apply_resolution_from_preset(self, width: int, height: int) -> None:
+        if width <= 0 or height <= 0:
+            return
+        resolution = (int(width), int(height))
+        label = next((lbl for lbl, res in self.resolution_presets if res == resolution), None)
+        if label is None:
+            label = f"Personnalisé ({resolution[0]}x{resolution[1]})"
+            current_values = list(self.resolution_combo["values"])
+            if label not in current_values:
+                current_values.append(label)
+                self.resolution_combo["values"] = current_values
+            self._resolution_lookup[label] = resolution
+        self.resolution_choice_var.set(label)
+        self.set_video_resolution(resolution)
+
+    def _apply_configuration_preset(self, config: dict) -> None:
+        if not isinstance(config, dict):
+            raise ValueError("format de preset invalide")
+
+        resolution = config.get("resolution")
+        if isinstance(resolution, (list, tuple)) and len(resolution) == 2:
+            try:
+                width = int(resolution[0])
+                height = int(resolution[1])
+            except (TypeError, ValueError):
+                width = height = None
+            if width and height:
+                self._apply_resolution_from_preset(width, height)
+
+        map_style = config.get("map_style")
+        if isinstance(map_style, str) and map_style in MAP_TILE_SERVERS:
+            self.map_style_var.set(map_style)
+            self.map_style_combo.set(map_style)
+
+        zoom_level = config.get("zoom_level")
+        if isinstance(zoom_level, int) and 1 <= zoom_level <= 12:
+            self.map_zoom_level_var.set(zoom_level)
+            self.zoom_combo.set(str(zoom_level))
+
+        colors = config.get("colors", {})
+        if isinstance(colors, dict):
+            for key, value in colors.items():
+                hex_color = rgb_to_hex(value)
+                self.color_configs[key] = hex_color
+                if key in self.color_preview_frames:
+                    self.color_preview_frames[key].config(background=hex_color)
+
+        elements = config.get("elements", {})
+        if isinstance(elements, dict):
+            previous_block_state = self._block_recursion
+            self._block_recursion = True
+            try:
+                for name, params in elements.items():
+                    if name not in DEFAULT_ELEMENT_CONFIGS or not isinstance(params, dict):
+                        continue
+                    visible = params.get("visible")
+                    if name in self.element_visibility_vars and visible is not None:
+                        self.element_visibility_vars[name].set(bool(visible))
+                    for key in ("x", "y", "width"):
+                        if key not in params or name not in self.element_pos_entries_vars:
+                            continue
+                        try:
+                            val = int(params[key])
+                        except (TypeError, ValueError):
+                            continue
+                        max_val = (
+                            self.current_video_resolution[0]
+                            if key in ("x", "width")
+                            else self.current_video_resolution[1]
+                        )
+                        val = max(0, min(val, max_val))
+                        entry_var = self.element_pos_entries_vars[name][key]
+                        slider_var = self.element_sliders_vars[name][key]
+                        entry_var.set(str(val))
+                        slider_var.set(val)
+                    if name in self.element_calculated_height_labels and "height" in params:
+                        try:
+                            height_val = int(params["height"])
+                        except (TypeError, ValueError):
+                            height_val = DEFAULT_ELEMENT_CONFIGS[name]["height"]
+                        self.element_calculated_height_labels[name].set(str(height_val))
+            finally:
+                self._block_recursion = previous_block_state
+
+        self.show_preview(force_update=True)
+
+    def save_configuration_preset(self) -> None:
+        config = self._collect_current_configuration()
+        initial_dir = os.path.dirname(self.gpx_file_path) if self.gpx_file_path else os.getcwd()
+        filename = filedialog.asksaveasfilename(
+            title="Enregistrer un preset",
+            defaultextension=".json",
+            filetypes=[("Preset GPX Overlay", "*.json"), ("Tous les fichiers", "*.*")],
+            initialdir=initial_dir,
+            initialfile="preset_overlay.json",
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, "w", encoding="utf-8") as fh:
+                json.dump(config, fh, ensure_ascii=False, indent=2)
+        except OSError as exc:
+            messagebox.showerror("Erreur", f"Impossible d'enregistrer le preset:\n{exc}")
+            return
+        messagebox.showinfo("Preset enregistré", f"Configuration enregistrée dans:\n{filename}")
+
+    def load_configuration_preset(self) -> None:
+        initial_dir = os.path.dirname(self.gpx_file_path) if self.gpx_file_path else os.getcwd()
+        filename = filedialog.askopenfilename(
+            title="Charger un preset",
+            filetypes=[("Preset GPX Overlay", "*.json"), ("Tous les fichiers", "*.*")],
+            initialdir=initial_dir,
+        )
+        if not filename:
+            return
+        try:
+            with open(filename, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError) as exc:
+            messagebox.showerror("Erreur", f"Impossible de charger le preset:\n{exc}")
+            return
+        try:
+            self._apply_configuration_preset(data)
+        except Exception as exc:  # pylint: disable=broad-except
+            messagebox.showerror("Erreur", f"Preset invalide:\n{exc}")
+            return
+        messagebox.showinfo("Preset chargé", f"Preset chargé depuis:\n{filename}")
 
     def get_smoothing_seconds(self) -> float:
         text = self.graph_smoothing_seconds_var.get().strip()
