@@ -2376,21 +2376,6 @@ class GPXVideoApp:
             self.show_preview(force_update=True)
         ttk.Button(btns, text="Réinitialiser", command=reset_colors).pack(side=tk.LEFT)
 
-        presets_frame = ttk.LabelFrame(main_frame, text="Presets disposition & couleurs", padding=(6, 6))
-        presets_frame.grid(row=2, column=0, sticky="ew", padx=(0, 12), pady=(8, 0))
-        presets_frame.columnconfigure(0, weight=1)
-        presets_frame.columnconfigure(1, weight=1)
-        ttk.Button(
-            presets_frame,
-            text="Enregistrer preset…",
-            command=self.save_configuration_preset,
-        ).grid(row=0, column=0, padx=4, pady=2, sticky="ew")
-        ttk.Button(
-            presets_frame,
-            text="Charger preset…",
-            command=self.load_configuration_preset,
-        ).grid(row=0, column=1, padx=4, pady=2, sticky="ew")
-
         # Panneau d’aperçu
         preview_panel_frame = ttk.LabelFrame(main_frame, text="Aperçu de la disposition", padding=(6, 6))
         preview_panel_frame.grid(row=1, column=1, sticky="nsew")
