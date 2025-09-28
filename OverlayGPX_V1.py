@@ -2146,20 +2146,23 @@ class GPXVideoApp:
         # Barre d’outils
         toolbar = ttk.Frame(main_frame, style="Toolbar.TFrame")
         toolbar.grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 12))
-        toolbar.columnconfigure(0, weight=0)
-        toolbar.columnconfigure(1, weight=0)
+        for col in range(6):
+            toolbar.columnconfigure(col, weight=0)
+
         ttk.Button(toolbar, text="Ouvrir GPX", command=self.select_gpx_file).grid(row=0, column=0, padx=(0, 6))
-        ttk.Button(toolbar, text="Prévisualiser 1ʳᵉ frame", command=self.preview_first_frame).grid(row=0, column=1, padx=6)
+        ttk.Button(toolbar, text="Enr. preset", command=self.save_configuration_preset).grid(row=0, column=1, padx=3)
+        ttk.Button(toolbar, text="Charger preset", command=self.load_configuration_preset).grid(row=0, column=2, padx=3)
+        ttk.Button(toolbar, text="Prévisualiser 1ʳᵉ frame", command=self.preview_first_frame).grid(row=0, column=3, padx=6)
         self.generate_btn = ttk.Button(toolbar, text="Générer Vidéo", style=self.accent_button_style, command=self.generate_video)
-        self.generate_btn.grid(row=0, column=2, sticky="w", padx=6)
-        ttk.Button(toolbar, text="Aide", command=self.show_help).grid(row=0, column=3, padx=(12, 0))
-        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=4, sticky="ns", padx=12)
+        self.generate_btn.grid(row=0, column=4, sticky="w", padx=6)
+        ttk.Button(toolbar, text="Aide", command=self.show_help).grid(row=0, column=5, padx=(12, 0))
+        ttk.Separator(toolbar, orient=tk.VERTICAL).grid(row=0, column=6, sticky="ns", padx=12)
         self.gpx_toolbar_label_var = tk.StringVar(value="GPX: aucun")
-        ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=5, sticky="w")
-        toolbar.columnconfigure(5, weight=1)
+        ttk.Label(toolbar, textvariable=self.gpx_toolbar_label_var, font=("Segoe UI", 10, "bold")).grid(row=0, column=7, sticky="w")
+        toolbar.columnconfigure(7, weight=1)
 
         self.progress_time_var = tk.StringVar(value=self.progress_message_default)
-        ttk.Label(toolbar, textvariable=self.progress_time_var, anchor="e").grid(row=0, column=6, sticky="e", padx=(12, 0))
+        ttk.Label(toolbar, textvariable=self.progress_time_var, anchor="e").grid(row=0, column=8, sticky="e", padx=(12, 0))
 
         # Colonne gauche avec onglets pour condenser l'interface
         config_panel_outer = ttk.Notebook(main_frame); self.config_panel_outer = config_panel_outer
