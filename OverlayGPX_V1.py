@@ -76,6 +76,17 @@ PACE_GRAPH_MAX = 8.0
 # Durée de lissage (secondes) par défaut appliquée aux données des graphes
 DEFAULT_GRAPH_SMOOTHING_SECONDS = 20.0
 
+# Paramètres de la caméra pseudo-3D
+MAP_VERTICAL_BIAS_BASE = 0.65
+MAP_VERTICAL_BIAS_GAIN = 0.18
+MAX_CAMERA_TILT_DEG = 55.0
+BASE_CAMERA_TILT_DEG = 8.0
+SPEED_TILT_MIN_SPEED = 3.0
+SPEED_TILT_MAX_SPEED = 35.0
+SPEED_TILT_RANGE = 28.0
+SLOPE_TILT_RANGE = 12.0
+TILT_SMOOTHING_FACTOR = 0.18
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -192,6 +203,95 @@ def hex_to_rgb(value):
 def darken_color(color, factor=0.7):
     r, g, b = hex_to_rgb(color)
     return (int(r * factor), int(g * factor), int(b * factor))
+
+def clamp(value: float, min_value: float, max_value: float) -> float:
+    return max(min_value, min(max_value, value))
+
+def compute_camera_tilt(speed_kmh: float, slope_percent: float) -> float:
+    """Calcule l'inclinaison de la caméra pseudo-3D selon vitesse et pente."""
+
+    speed = max(0.0, float(speed_kmh))
+    slope = float(slope_percent)
+    if SPEED_TILT_MAX_SPEED <= SPEED_TILT_MIN_SPEED:
+        speed_norm = 0.0
+    else:
+        speed_norm = clamp(
+            (speed - SPEED_TILT_MIN_SPEED)
+            / (SPEED_TILT_MAX_SPEED - SPEED_TILT_MIN_SPEED),
+            0.0,
+            1.0,
+        )
+    base_tilt = BASE_CAMERA_TILT_DEG * (0.4 + 0.6 * speed_norm)
+    tilt_from_speed = speed_norm * SPEED_TILT_RANGE
+    slope_norm = clamp(slope / 12.0, -1.0, 1.0)
+    slope_weight = 0.5 + 0.5 * clamp(speed / SPEED_TILT_MAX_SPEED, 0.0, 1.0)
+    tilt_from_slope = slope_norm * SLOPE_TILT_RANGE * slope_weight
+    tilt = base_tilt + tilt_from_speed + tilt_from_slope
+    return clamp(tilt, 0.0, MAX_CAMERA_TILT_DEG)
+
+def compute_vertical_bias(tilt_deg: float) -> float:
+    """Retourne un biais vertical dépendant de l'inclinaison."""
+
+    tilt_norm = clamp(float(tilt_deg) / MAX_CAMERA_TILT_DEG if MAX_CAMERA_TILT_DEG else 0.0, 0.0, 1.0)
+    return clamp(MAP_VERTICAL_BIAS_BASE + tilt_norm * MAP_VERTICAL_BIAS_GAIN, 0.55, 0.92)
+
+def _solve_perspective_coeffs(src_pts, dst_pts):
+    matrix = []
+    target = []
+    for (x, y), (u, v) in zip(src_pts, dst_pts):
+        matrix.append([x, y, 1, 0, 0, 0, -u * x, -u * y])
+        matrix.append([0, 0, 0, x, y, 1, -v * x, -v * y])
+        target.append(u)
+        target.append(v)
+    a = np.array(matrix, dtype=float)
+    b = np.array(target, dtype=float)
+    return np.linalg.solve(a, b)
+
+def apply_perspective_tilt(image: Image.Image, tilt_deg: float, bg_color) -> Image.Image:
+    """Projette une vue 2D sur un plan incliné en perspective."""
+
+    if tilt_deg <= 1e-3:
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    w, h = image.size
+    if w == 0 or h == 0:
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    tilt_norm = clamp(tilt_deg / MAX_CAMERA_TILT_DEG if MAX_CAMERA_TILT_DEG else 0.0, 0.0, 1.0)
+    top_scale = 1.0 - 0.5 * tilt_norm
+    top_width = w * top_scale
+    top_offset = (w - top_width) / 2.0
+    horizon_lift = h * (0.05 + 0.35 * tilt_norm)
+
+    src_pts = [(0.0, 0.0), (float(w), 0.0), (float(w), float(h)), (0.0, float(h))]
+    dst_pts = [
+        (top_offset, horizon_lift),
+        (w - top_offset, horizon_lift),
+        (float(w), float(h)),
+        (0.0, float(h)),
+    ]
+    if isinstance(bg_color, str):
+        bg_tuple = hex_to_rgb(bg_color)
+    else:
+        bg_tuple = tuple(bg_color)
+    if len(bg_tuple) != 3:
+        bg_tuple = (0, 0, 0)
+
+    try:
+        coeffs = _solve_perspective_coeffs(src_pts, dst_pts)
+    except np.linalg.LinAlgError:
+        return image.convert("RGB") if image.mode != "RGB" else image
+
+    rgba = image.convert("RGBA")
+    transformed = rgba.transform(
+        (w, h),
+        Image.PERSPECTIVE,
+        coeffs,
+        resample=Image.BICUBIC,
+    )
+    background = Image.new("RGBA", (w, h), tuple(bg_tuple) + (255,))
+    composited = Image.alpha_composite(background, transformed)
+    return composited.convert("RGB")
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
@@ -1212,7 +1312,6 @@ def generate_gpx_video(
     # --- Config interne ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
-    VERTICAL_BIAS = 0.65
 
     # Polices & couleurs
     graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
@@ -1495,6 +1594,17 @@ def generate_gpx_video(
             if total_samples
             else 0.0
         )
+        initial_speed = (
+            float(interp_speeds[clip_start_frame])
+            if total_samples
+            else 0.0
+        )
+        initial_slope = (
+            float(interp_slopes[clip_start_frame])
+            if total_samples
+            else 0.0
+        )
+        last_tilt_deg = compute_camera_tilt(initial_speed, initial_slope)
 
         for frame_count, global_idx in enumerate(
             range(clip_start_frame, clip_end_frame_exclusive)
@@ -1531,6 +1641,7 @@ def generate_gpx_video(
 
             # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[global_idx])
+            slope_pct = float(interp_slopes[global_idx])
             desired_heading = math.degrees(smoothed_angles[global_idx])
             if speed_kmh >= 4.0:
                 diff = ((desired_heading - last_heading_deg + 180) % 360) - 180
@@ -1544,9 +1655,22 @@ def generate_gpx_video(
             )
 
             # Recadrage EXACT viewport
-            view_left = int(round(patch_w / 2.0 - mw / 2.0))
-            view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+            desired_tilt = compute_camera_tilt(speed_kmh, slope_pct)
+            last_tilt_deg += TILT_SMOOTHING_FACTOR * (desired_tilt - last_tilt_deg)
+            tilt_deg = last_tilt_deg
+            vertical_bias = compute_vertical_bias(tilt_deg)
+            view_left = int(round(clamp(patch_w / 2.0 - mw / 2.0, 0.0, max(0.0, patch_w - mw))))
+            view_top = int(
+                round(
+                    clamp(
+                        patch_h / 2.0 - vertical_bias * mh,
+                        0.0,
+                        max(0.0, patch_h - mh),
+                    )
+                )
+            )
             view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+            view = apply_perspective_tilt(view, tilt_deg, bg_c)
 
             # Collage final
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
@@ -1653,7 +1777,6 @@ def render_first_frame_image(
     # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
-    VERTICAL_BIAS = 0.65
 
     graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
     try:
@@ -1903,6 +2026,7 @@ def render_first_frame_image(
         pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
         speed_kmh0 = float(interp_speeds[current_idx])
+        slope_pct0 = float(interp_slopes[current_idx])
         heading_deg = (
             0.0
             if speed_kmh0 < 4.0
@@ -1914,9 +2038,20 @@ def render_first_frame_image(
             expand=False,
             center=(patch_w / 2.0, patch_h / 2.0),
         )
-        view_left = int(round(patch_w / 2.0 - mw / 2.0))
-        view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
+        desired_tilt = compute_camera_tilt(speed_kmh0, slope_pct0)
+        vertical_bias = compute_vertical_bias(desired_tilt)
+        view_left = int(round(clamp(patch_w / 2.0 - mw / 2.0, 0.0, max(0.0, patch_w - mw))))
+        view_top = int(
+            round(
+                clamp(
+                    patch_h / 2.0 - vertical_bias * mh,
+                    0.0,
+                    max(0.0, patch_h - mh),
+                )
+            )
+        )
         view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+        view = apply_perspective_tilt(view, desired_tilt, bg_c)
 
         frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
 
