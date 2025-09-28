@@ -3,6 +3,7 @@
 # emprise large fiable (WebMercator), durée par défaut 20s.
 
 import json
+import copy
 import math
 import os
 from datetime import datetime, timedelta
@@ -172,6 +173,236 @@ DEFAULT_ELEMENT_CONFIGS = {
 }
 
 # ---------- Utils GPX & maths ----------
+
+
+def analyse_gpx_metrics(points: list[dict]) -> dict:
+    """Return max speed (km/h), max heart rate and duration (seconds).
+
+    The computation is resilient to duplicated timestamps and missing values.
+    """
+
+    max_speed_kmh = 0.0
+    max_hr = None
+    duration_seconds = 0.0
+
+    if not points:
+        return {
+            "max_speed_kmh": max_speed_kmh,
+            "max_hr": max_hr,
+            "duration_seconds": duration_seconds,
+        }
+
+    prev_point = None
+    for point in points:
+        if prev_point is None:
+            prev_point = point
+            continue
+        try:
+            t1 = prev_point["time"]
+            t2 = point["time"]
+            delta_t = (t2 - t1).total_seconds() if (t1 and t2) else 0.0
+        except Exception:
+            delta_t = 0.0
+        if delta_t > 0:
+            distance = haversine(
+                prev_point["lat"],
+                prev_point["lon"],
+                point["lat"],
+                point["lon"],
+            )
+            speed_ms = distance / delta_t
+            speed_kmh = speed_ms * 3.6
+            if speed_kmh > max_speed_kmh:
+                max_speed_kmh = speed_kmh
+        prev_point = point
+
+    hr_values = [p.get("hr") for p in points if p.get("hr") is not None]
+    if hr_values:
+        max_hr = float(max(hr_values))
+
+    try:
+        start_time = points[0]["time"]
+        end_time = points[-1]["time"]
+        if start_time and end_time:
+            duration_seconds = max(0.0, (end_time - start_time).total_seconds())
+    except Exception:
+        duration_seconds = 0.0
+
+    return {
+        "max_speed_kmh": float(max_speed_kmh),
+        "max_hr": max_hr,
+        "duration_seconds": float(duration_seconds),
+    }
+
+
+def auto_layout_element_configs(points: list[dict], resolution: tuple[int, int], base_configs=None):
+    """Compute a collision-free layout tailored to the GPX metrics and resolution."""
+
+    if base_configs is None:
+        base_configs = DEFAULT_ELEMENT_CONFIGS
+
+    metrics = analyse_gpx_metrics(points)
+    has_hr = metrics["max_hr"] is not None
+
+    element_configs = {name: copy.deepcopy(cfg) for name, cfg in base_configs.items()}
+
+    width, height = resolution
+    width = max(width, 640)
+    height = max(height, 480)
+    margin = max(6, MARGIN)
+    section_gap = max(8, min(32, int(height * 0.03)))
+
+    usable_width = max(width - 3 * margin, 300)
+    min_left = 320
+    min_right = 280
+    if usable_width <= min_left + min_right:
+        left_width = usable_width // 2
+        right_width = usable_width - left_width
+    else:
+        left_width = max(int(usable_width * 0.55), min_left)
+        right_width = max(usable_width - left_width, min_right)
+        if right_width < min_right:
+            right_width = min_right
+            left_width = max(min_left, usable_width - right_width)
+        if left_width < min_left:
+            left_width = min_left
+            right_width = max(min_right, usable_width - left_width)
+
+    if left_width + right_width > usable_width:
+        overflow = left_width + right_width - usable_width
+        reduce_left = min(overflow // 2, max(0, left_width - min_left))
+        left_width -= reduce_left
+        overflow -= reduce_left
+        right_width -= min(overflow, max(0, right_width - min_right))
+
+    left_width = max(240, left_width)
+    right_width = max(240, right_width)
+
+    left_x = margin
+    right_x = left_x + left_width + margin
+
+    segments = 4
+    usable_height = height - (segments + 1) * section_gap
+    if usable_height <= 0:
+        section_gap = max(4, int(height / 20))
+        usable_height = max(1, height - (segments + 1) * section_gap)
+
+    speed_scale = 1.0 + min(0.6, metrics["max_speed_kmh"] / 60.0)
+    map_height = max(int(usable_height * 0.45), 220)
+    info_height = max(int(usable_height * 0.2), 140)
+    linear_height = max(int(usable_height * 0.1 * speed_scale), 45)
+    used_height = map_height + info_height + linear_height
+    remaining_height = usable_height - used_height
+    if remaining_height < 120:
+        deficit = 120 - remaining_height
+        map_height = max(180, map_height - int(deficit * 0.6))
+        info_height = max(120, info_height - int(deficit * 0.25))
+        linear_height = max(40, linear_height - int(deficit * 0.15))
+        used_height = map_height + info_height + linear_height
+        remaining_height = max(120, usable_height - used_height)
+    bottom_height = remaining_height
+
+    map_y = section_gap
+    info_y = map_y + map_height + section_gap
+    linear_y = info_y + info_height + section_gap
+    bottom_y = linear_y + linear_height + section_gap
+
+    element_configs["Carte"].update({
+        "x": left_x,
+        "y": map_y,
+        "width": left_width,
+        "height": map_height,
+    })
+
+    element_configs["Infos Texte"].update({
+        "x": left_x,
+        "y": info_y,
+        "width": left_width,
+        "height": info_height,
+    })
+
+    linear_height = max(30, linear_height)
+    element_configs["Jauge Vitesse Linéaire"].update({
+        "x": left_x,
+        "y": linear_y,
+        "width": left_width,
+        "height": linear_height,
+    })
+
+    circular_size = int(min(bottom_height, left_width * 0.35))
+    compteur_min_width = max(260, int(60 * (len(str(int(max(metrics["max_speed_kmh"], 1)))) + 1)))
+    available_for_compteur = left_width - section_gap - circular_size
+    if available_for_compteur < compteur_min_width:
+        deficit = compteur_min_width - available_for_compteur
+        circular_size = max(0, circular_size - deficit)
+        available_for_compteur = left_width - section_gap - circular_size
+    if available_for_compteur < compteur_min_width:
+        circular_size = 0
+        available_for_compteur = left_width
+
+    compteur_width = max(compteur_min_width, available_for_compteur)
+    compteur_x = left_x + (circular_size + section_gap if circular_size else 0)
+
+    element_configs["Compteur de vitesse"].update({
+        "x": compteur_x,
+        "y": bottom_y,
+        "width": compteur_width,
+        "height": bottom_height,
+    })
+
+    element_configs["Jauge Vitesse Circulaire"].update({
+        "x": left_x,
+        "y": bottom_y,
+        "width": circular_size,
+        "height": bottom_height,
+    })
+
+    compass_height = max(int(height * 0.08), 70)
+    compass_y = section_gap
+    element_configs["Boussole (ruban)"].update({
+        "x": right_x,
+        "y": compass_y,
+        "width": right_width,
+        "height": compass_height,
+    })
+
+    graph_gap = section_gap
+    graph_top = compass_y + compass_height + graph_gap
+    graph_available = max(100, height - graph_top - section_gap)
+    graph_names = [
+        "Profil Altitude",
+        "Profil Vitesse",
+        "Profil Allure",
+    ]
+    if has_hr:
+        graph_names.append("Profil Cardio")
+    else:
+        element_configs["Profil Cardio"]["visible"] = False
+
+    graph_count = len(graph_names)
+    if graph_count:
+        base_graph_height = (graph_available - graph_gap * (graph_count - 1)) / graph_count
+        duration_hours = metrics["duration_seconds"] / 3600.0 if metrics["duration_seconds"] else 0.0
+        duration_scale = 1.0 + min(0.5, duration_hours * 0.25)
+        graph_height = int(max(90, min(240, base_graph_height * duration_scale)))
+        total_needed = graph_height * graph_count + graph_gap * (graph_count - 1)
+        if total_needed > graph_available:
+            excess = total_needed - graph_available
+            reduction = int(math.ceil(excess / graph_count))
+            graph_height = max(90, graph_height - reduction)
+
+        current_y = graph_top
+        for name in graph_names:
+            element_configs[name].update({
+                "x": right_x,
+                "y": current_y,
+                "width": right_width,
+                "height": graph_height,
+                "visible": element_configs[name].get("visible", True),
+            })
+            current_y += graph_height + graph_gap
+
+    return element_configs, metrics
 
 def rgb_to_hex(rgb_tuple):
     if isinstance(rgb_tuple, str) and rgb_tuple.startswith("#"):
@@ -2015,6 +2246,8 @@ class GPXVideoApp:
         self.gpx_file_path = ""
         self.gpx_start_time_raw = None
         self.gpx_end_time_raw = None
+        self.current_gpx_points: list[dict] = []
+        self.auto_layout_metrics: dict | None = None
         self.start_offset_var = tk.IntVar(value=0)
         self.pre_roll_var = tk.IntVar(value=0)
         self.post_roll_var = tk.IntVar(value=0)
@@ -2620,10 +2853,43 @@ class GPXVideoApp:
         try:
             self.current_video_resolution = [new_width, new_height]
             self.update_all_slider_ranges()
-            self._scale_layout_for_resolution(scale_x, scale_y)
+            if not self.current_gpx_points:
+                self._scale_layout_for_resolution(scale_x, scale_y)
         finally:
             self._block_recursion = False
-        self.show_preview(force_update=True)
+        if self.current_gpx_points:
+            self.apply_auto_layout_from_points(self.current_gpx_points)
+        else:
+            self.show_preview(force_update=True)
+
+    def apply_auto_layout_from_points(self, points: list[dict], update_preview: bool = True) -> None:
+        if not points:
+            return
+        resolution = tuple(self.current_video_resolution)
+        auto_configs, metrics = auto_layout_element_configs(points, resolution)
+        self.auto_layout_metrics = metrics
+
+        self._block_recursion = True
+        try:
+            for name, cfg in auto_configs.items():
+                defaults = DEFAULT_ELEMENT_CONFIGS.get(name, {})
+                visible = cfg.get("visible", defaults.get("visible", True))
+                if name in self.element_visibility_vars:
+                    self.element_visibility_vars[name].set(bool(visible))
+                if name in self.element_pos_entries_vars:
+                    for key in ("x", "y", "width"):
+                        value = int(cfg.get(key, defaults.get(key, 0)))
+                        self.element_pos_entries_vars[name][key].set(str(value))
+                        if key in self.element_sliders_vars.get(name, {}):
+                            self.element_sliders_vars[name][key].set(value)
+                if name in self.element_calculated_height_labels:
+                    height_val = int(cfg.get("height", defaults.get("height", 0)))
+                    self.element_calculated_height_labels[name].set(str(height_val))
+        finally:
+            self._block_recursion = False
+
+        if update_preview:
+            self.show_preview(force_update=True)
 
     def _scale_layout_for_resolution(self, scale_x: float, scale_y: float) -> None:
         max_w, max_h = self.current_video_resolution
@@ -2940,22 +3206,30 @@ class GPXVideoApp:
     def select_gpx_file(self):
         filetypes = [("Fichiers GPX", "*.gpx"), ("Tous les fichiers", "*.*")]
         filename = filedialog.askopenfilename(title="Choisir un fichier GPX", filetypes=filetypes)
-        if filename:
-            self.gpx_file_path = filename
-            points, start, end = parse_gpx(filename)
-            if not points:
-                messagebox.showerror("Erreur", "Impossible de charger le fichier GPX."); return
-            self.gpx_start_time_raw = start; self.gpx_end_time_raw = end
-            base = os.path.basename(filename)
-            self.start_offset_var.set(0)
-            self.pre_roll_var.set(0)
-            self.post_roll_var.set(0)
+        if not filename:
+            return
 
-            self.update_duration_max()
+        self.gpx_file_path = filename
+        points, start, end = parse_gpx(filename)
+        if not points:
+            messagebox.showerror("Erreur", "Impossible de charger le fichier GPX.")
+            return
+        self.gpx_start_time_raw = start
+        self.gpx_end_time_raw = end
+        self.current_gpx_points = points
+        base = os.path.basename(filename)
+        self.start_offset_var.set(0)
+        self.pre_roll_var.set(0)
+        self.post_roll_var.set(0)
 
-            self.update_start_offset_max()
-            self.update_margin_scales()
-        self.gpx_label.config(text=f"Fichier GPX: {base}"); self.gpx_toolbar_label_var.set(f"GPX: {base}")
+        self.update_duration_max()
+
+        self.update_start_offset_max()
+        self.update_margin_scales()
+        self.apply_auto_layout_from_points(points)
+
+        self.gpx_label.config(text=f"Fichier GPX: {base}")
+        self.gpx_toolbar_label_var.set(f"GPX: {base}")
         tz = pytz.timezone('Europe/Paris')
         self.gpx_start_time_label.config(text=f"Début GPX: {start.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')}" if start else "Début GPX: N/A")
         self.gpx_end_time_label.config(text=f"Fin GPX: {end.astimezone(tz).strftime('%Y-%m-%d %H:%M:%S')}" if end else "Fin GPX: N/A")
