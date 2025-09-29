@@ -83,7 +83,9 @@ MAP_HEIGHT_DEFAULT = 480
 MAP_BOTTOM = MARGIN + MAP_HEIGHT_DEFAULT
 COMPASS_HEIGHT = 70
 COMPASS_Y = 1000
-INFO_LINES_COUNT = 6
+# Nombre de lignes d'information texte affichées (Vitesse, Altitude, Heure,
+# Distance, Pente, Allure, FC)
+INFO_LINES_COUNT = 7
 INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
 INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
 INFO_TEXT_Y = 450
@@ -417,10 +419,13 @@ def prepare_track_arrays(
         dist_interp = haversine_np(
             interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
         )
+        interp_distances = np.zeros_like(interp_lats, dtype=float)
+        np.cumsum(dist_interp, out=interp_distances[1:])
         elev_diff = np.diff(interp_eles)
         seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
         interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
     else:
+        interp_distances = np.zeros_like(interp_lats, dtype=float)
         interp_slopes = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
@@ -452,6 +457,7 @@ def prepare_track_arrays(
         "interp_eles": interp_eles,
         "interp_speeds": interp_speeds,
         "interp_slopes": interp_slopes,
+        "interp_distances": interp_distances,
         "interp_pace": interp_pace,
         "interp_hrs": interp_hrs,
     }
@@ -1009,16 +1015,27 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
     pivot_r = max(3, int(radius * 0.04))
     draw.ellipse([cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r], fill=(255, 255, 255))
 
-def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
+def draw_info_text(draw, speed, altitude, slope, distance_m, current_time, draw_area, font, tz, text_color):
     display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
-    draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + FONT_SIZE_LARGE + 10), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 2 * (FONT_SIZE_LARGE + 10)), f"Heure : {display_time}", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 3 * (FONT_SIZE_LARGE + 10)), f"Pente : {slope:.1f} %", font=font, fill=text_color)
+    line_step = FONT_SIZE_LARGE + 10
+    x0 = draw_area["x"]
+    y0 = draw_area["y"]
+    distance_km = max(0.0, distance_m / 1000.0)
 
-# --- AJOUT : texte allure & FC (dessiné sous les 3 lignes existantes) ---
+    lines = [
+        f"Vitesse : {speed:.0f} km/h",
+        f"Altitude : {altitude:.0f} m",
+        f"Heure : {display_time}",
+        f"Distance : {distance_km:.2f} km",
+        f"Pente : {slope:.1f} %",
+    ]
+
+    for idx, text in enumerate(lines):
+        draw.text((x0, y0 + idx * line_step), text, font=font, fill=text_color)
+
+# --- AJOUT : texte allure & FC (dessiné sous les lignes d'infos principales) ---
 def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
-    y0 = draw_area["y"] + 4 * (FONT_SIZE_LARGE + 10)
+    y0 = draw_area["y"] + 5 * (FONT_SIZE_LARGE + 10)
     pace_txt = format_pace_mmss(pace_minpk)
     hr_txt = "—" if hr_bpm is None or not np.isfinite(hr_bpm) else f"{hr_bpm:.0f} bpm"
     draw.text((draw_area["x"], y0), f"Allure : {pace_txt}", font=font, fill=text_color)
@@ -1334,6 +1351,7 @@ def generate_gpx_video(
     interp_eles = data["interp_eles"]
     interp_speeds = data["interp_speeds"]
     interp_slopes = data["interp_slopes"]
+    interp_distances = data["interp_distances"]
     interp_pace = data["interp_pace"]
     interp_hrs = data["interp_hrs"]
 
@@ -1607,6 +1625,7 @@ def generate_gpx_video(
                                float(interp_speeds[global_idx]),
                                float(interp_eles[global_idx]),
                                float(interp_slopes[global_idx]),
+                               float(interp_distances[global_idx]),
                                extended_start_time + timedelta(seconds=float(interp_times[global_idx])),
                                info_area, font_medium, tz, text_c)
                 # --- Texte Allure & FC supplémentaires ---
@@ -1977,6 +1996,7 @@ def render_first_frame_image(
                        float(interp_speeds[current_idx]),
                        float(interp_eles[current_idx]),
                        float(interp_slopes[current_idx]),
+                       float(interp_distances[current_idx]),
                        extended_start_time + timedelta(seconds=float(interp_times[current_idx])),
                        info_area, font_medium, tz, text_c)
         pace_now = float(interp_pace[current_idx])
