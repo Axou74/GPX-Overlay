@@ -83,7 +83,7 @@ MAP_HEIGHT_DEFAULT = 480
 MAP_BOTTOM = MARGIN + MAP_HEIGHT_DEFAULT
 COMPASS_HEIGHT = 70
 COMPASS_Y = 1000
-INFO_LINES_COUNT = 6
+INFO_LINES_COUNT = 7
 INFO_LINE_SPACING = FONT_SIZE_LARGE + 10
 INFO_TEXT_HEIGHT = INFO_LINES_COUNT * INFO_LINE_SPACING
 INFO_TEXT_Y = 450
@@ -167,7 +167,7 @@ DEFAULT_ELEMENT_CONFIGS = {
         "x": MARGIN,
         "y": INFO_TEXT_Y,
         "width": 368,
-        "height": INFO_TEXT_HEIGHT,  # 6 lignes : Vitesse, Altitude, Heure, Pente, Allure, FC
+        "height": INFO_TEXT_HEIGHT,  # 7 lignes : Vitesse, Altitude, Heure, Distance, Pente, Allure, FC
     },
 }
 
@@ -420,8 +420,10 @@ def prepare_track_arrays(
         elev_diff = np.diff(interp_eles)
         seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
         interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
+        interp_cumdist = np.concatenate(([0.0], np.cumsum(dist_interp)))
     else:
         interp_slopes = np.zeros_like(interp_eles)
+        interp_cumdist = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
         interp_slopes = smooth_series(interp_slopes, smoothing_frames)
@@ -454,7 +456,16 @@ def prepare_track_arrays(
         "interp_slopes": interp_slopes,
         "interp_pace": interp_pace,
         "interp_hrs": interp_hrs,
+        "interp_cumdist": interp_cumdist,
     }
+
+
+def format_distance(distance_m: float) -> str:
+    """Formate une distance en mètres vers un affichage lisible (m ou km)."""
+    distance_m = max(0.0, float(distance_m))
+    if distance_m < 1000.0:
+        return f"{distance_m:.0f} m"
+    return f"{distance_m / 1000.0:.2f} km"
 
 
 def format_hms(seconds: int) -> str:
@@ -1009,20 +1020,26 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
     pivot_r = max(3, int(radius * 0.04))
     draw.ellipse([cx - pivot_r, cy - pivot_r, cx + pivot_r, cy + pivot_r], fill=(255, 255, 255))
 
-def draw_info_text(draw, speed, altitude, slope, current_time, draw_area, font, tz, text_color):
+def draw_info_text(draw, speed, altitude, slope, distance_m, current_time, draw_area, font, tz, text_color):
+    line_spacing = INFO_LINE_SPACING
+    base_x = draw_area["x"]
+    base_y = draw_area["y"]
     display_time = current_time.astimezone(tz).strftime("%H:%M:%S")
-    draw.text((draw_area["x"], draw_area["y"]), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + FONT_SIZE_LARGE + 10), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 2 * (FONT_SIZE_LARGE + 10)), f"Heure : {display_time}", font=font, fill=text_color)
-    draw.text((draw_area["x"], draw_area["y"] + 3 * (FONT_SIZE_LARGE + 10)), f"Pente : {slope:.1f} %", font=font, fill=text_color)
+    distance_txt = format_distance(distance_m)
 
-# --- AJOUT : texte allure & FC (dessiné sous les 3 lignes existantes) ---
+    draw.text((base_x, base_y), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
+    draw.text((base_x, base_y + line_spacing), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
+    draw.text((base_x, base_y + 2 * line_spacing), f"Heure : {display_time}", font=font, fill=text_color)
+    draw.text((base_x, base_y + 3 * line_spacing), f"Distance : {distance_txt}", font=font, fill=text_color)
+    draw.text((base_x, base_y + 4 * line_spacing), f"Pente : {slope:.1f} %", font=font, fill=text_color)
+
+# --- AJOUT : texte allure & FC (dessiné sous les lignes d'infos principales) ---
 def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
-    y0 = draw_area["y"] + 4 * (FONT_SIZE_LARGE + 10)
+    y0 = draw_area["y"] + 5 * INFO_LINE_SPACING
     pace_txt = format_pace_mmss(pace_minpk)
     hr_txt = "—" if hr_bpm is None or not np.isfinite(hr_bpm) else f"{hr_bpm:.0f} bpm"
     draw.text((draw_area["x"], y0), f"Allure : {pace_txt}", font=font, fill=text_color)
-    draw.text((draw_area["x"], y0 + (FONT_SIZE_LARGE + 10)), f"FC : {hr_txt}", font=font, fill=text_color)
+    draw.text((draw_area["x"], y0 + INFO_LINE_SPACING), f"FC : {hr_txt}", font=font, fill=text_color)
 
 def draw_north_arrow(img, map_area, rotation_deg, color):
     size = 40
@@ -1336,6 +1353,7 @@ def generate_gpx_video(
     interp_slopes = data["interp_slopes"]
     interp_pace = data["interp_pace"]
     interp_hrs = data["interp_hrs"]
+    interp_cumdist = data["interp_cumdist"]
 
 
     # Zones UI
@@ -1607,6 +1625,7 @@ def generate_gpx_video(
                                float(interp_speeds[global_idx]),
                                float(interp_eles[global_idx]),
                                float(interp_slopes[global_idx]),
+                               float(interp_cumdist[global_idx]),
                                extended_start_time + timedelta(seconds=float(interp_times[global_idx])),
                                info_area, font_medium, tz, text_c)
                 # --- Texte Allure & FC supplémentaires ---
@@ -1977,6 +1996,7 @@ def render_first_frame_image(
                        float(interp_speeds[current_idx]),
                        float(interp_eles[current_idx]),
                        float(interp_slopes[current_idx]),
+                       float(interp_cumdist[current_idx]),
                        extended_start_time + timedelta(seconds=float(interp_times[current_idx])),
                        info_area, font_medium, tz, text_c)
         pace_now = float(interp_pace[current_idx])
@@ -2221,20 +2241,22 @@ class GPXVideoApp:
         self.clip_time_label.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 6))
 
         self.pre_roll_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.pre_roll_var, orient=tk.HORIZONTAL)
-        self.pre_roll_label = ttk.Label(gen_params_frame, text="0 s", anchor="e")
+        self.pre_roll_label = ttk.Label(gen_params_frame, text=format_hms(int(self.pre_roll_var.get())), anchor="e")
         self.pre_roll_var.trace_add("write", self.on_pre_roll_change)
         row += 1
-        ttk.Label(gen_params_frame, text="Temps affiché avant le clip (s):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Label(gen_params_frame, text="Temps affiché avant le clip :").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         self.pre_roll_scale.grid(row=row, column=1, sticky="ew", pady=2)
         self.pre_roll_label.grid(row=row, column=2, sticky="e", padx=(8, 0))
+        self.update_pre_roll_label()
 
         self.post_roll_scale = ttk.Scale(gen_params_frame, from_=0, to=0, variable=self.post_roll_var, orient=tk.HORIZONTAL)
-        self.post_roll_label = ttk.Label(gen_params_frame, text="0 s", anchor="e")
+        self.post_roll_label = ttk.Label(gen_params_frame, text=format_hms(int(self.post_roll_var.get())), anchor="e")
         self.post_roll_var.trace_add("write", self.on_post_roll_change)
         row += 1
-        ttk.Label(gen_params_frame, text="Temps affiché après le clip (s):").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
+        ttk.Label(gen_params_frame, text="Temps affiché après le clip :").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=2)
         self.post_roll_scale.grid(row=row, column=1, sticky="ew", pady=2)
         self.post_roll_label.grid(row=row, column=2, sticky="e", padx=(8, 0))
+        self.update_post_roll_label()
 
         row += 1
         self.display_time_label = ttk.Label(gen_params_frame, text="Fenêtre affichée: début N/A - fin N/A")
@@ -2745,11 +2767,11 @@ class GPXVideoApp:
 
     def update_pre_roll_label(self, *args):
         if hasattr(self, "pre_roll_label"):
-            self.pre_roll_label.config(text=f"{int(self.pre_roll_var.get())} s")
+            self.pre_roll_label.config(text=format_hms(int(self.pre_roll_var.get())))
 
     def update_post_roll_label(self, *args):
         if hasattr(self, "post_roll_label"):
-            self.post_roll_label.config(text=f"{int(self.post_roll_var.get())} s")
+            self.post_roll_label.config(text=format_hms(int(self.post_roll_var.get())))
 
     def update_margin_scales(self):
         if not hasattr(self, "pre_roll_scale") or not hasattr(self, "post_roll_scale"):
