@@ -193,6 +193,65 @@ def darken_color(color, factor=0.7):
     r, g, b = hex_to_rgb(color)
     return (int(r * factor), int(g * factor), int(b * factor))
 
+
+def create_rgba_overlay(size, fill=(0, 0, 0, 0)):
+    """Crée une image RGBA transparente utilitaire."""
+
+    return Image.new("RGBA", size, fill)
+
+
+def build_full_path_image(size, points, color, width):
+    """Construit l'image RGBA contenant la trace complète."""
+
+    full_image = create_rgba_overlay(size)
+    if len(points) >= 2:
+        draw = ImageDraw.Draw(full_image)
+        draw.line([tuple(pt) for pt in points], fill=color, width=width)
+    return full_image
+
+
+def init_path_progress_image(size, points, upto_index, color, width):
+    """Initialise l'image de progression en traçant les segments déjà parcourus."""
+
+    progress_image = create_rgba_overlay(size)
+    draw = ImageDraw.Draw(progress_image)
+    upto_index = min(len(points) - 1, max(0, int(upto_index)))
+    for idx in range(1, upto_index + 1):
+        x0, y0 = map(int, points[idx - 1])
+        x1, y1 = map(int, points[idx])
+        draw.line([(x0, y0), (x1, y1)], fill=color, width=width)
+    return progress_image, upto_index
+
+
+def append_progress_segment(progress_image, points, index, color, width, last_index):
+    """Ajoute uniquement le segment [index-1 -> index] sur l'image de progression."""
+
+    if not progress_image or len(points) < 2:
+        return last_index
+    index = int(index)
+    if index <= 0 or index <= last_index or index >= len(points):
+        return last_index
+    draw = ImageDraw.Draw(progress_image)
+    x0, y0 = map(int, points[index - 1])
+    x1, y1 = map(int, points[index])
+    draw.line([(x0, y0), (x1, y1)], fill=color, width=width)
+    return index
+
+
+def composite_paths_on_patch(patch_img, path_full_img, path_progress_img, crop_box, dest_xy):
+    """Compose les overlays de trace sur un patch carte."""
+
+    left, top, right, bottom = crop_box
+    if right <= left or bottom <= top:
+        return
+    if path_full_img is not None:
+        full_crop = path_full_img.crop(crop_box)
+        patch_img.paste(full_crop, dest_xy, full_crop)
+    if path_progress_img is not None:
+        prog_crop = path_progress_img.crop(crop_box)
+        patch_img.paste(prog_crop, dest_xy, prog_crop)
+
+
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
     phi1, phi2 = map(math.radians, [lat1, lat2])
@@ -1467,7 +1526,12 @@ def generate_gpx_video(
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
+        path_full_img = build_full_path_image(
+            (width_large, height_large), global_xy, map_path_c, 3
+        )
+        path_progress_img, last_progress_idx = init_path_progress_image(
+            (width_large, height_large), global_xy, clip_start_frame, map_current_path_c, 4
+        )
 
         # Tête lissée (pour rotation)
         if total_samples == 0:
@@ -1514,7 +1578,8 @@ def generate_gpx_video(
             xc = float(x_full[global_idx]); yc = float(y_full[global_idx])
             patch_left = int(round(xc - patch_w / 2.0))
             patch_top  = int(round(yc - patch_h / 2.0))
-            patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+            patch_img = Image.new("RGBA", (patch_w, patch_h), (*bg_c, 255))
+            crop_box = None
 
             src_left   = max(0, patch_left)
             src_top    = max(0, patch_top)
@@ -1525,15 +1590,27 @@ def generate_gpx_video(
                 dest_x = src_left - patch_left
                 dest_y = src_top  - patch_top
                 patch_img.paste(crop, (dest_x, dest_y))
+                crop_box = (src_left, src_top, src_right, src_bottom)
+                composite_paths_on_patch(
+                    patch_img, path_full_img, path_progress_img, crop_box, (dest_x, dest_y)
+                )
 
-            # Trace + progression + point (dans le patch)
+            if global_idx > last_progress_idx:
+                last_progress_idx = append_progress_segment(
+                    path_progress_img, global_xy, global_idx, map_current_path_c, 4, last_progress_idx
+                )
+                if crop_box is not None:
+                    composite_paths_on_patch(
+                        patch_img,
+                        None,
+                        path_progress_img,
+                        crop_box,
+                        (crop_box[0] - patch_left, crop_box[1] - patch_top),
+                    )
+
+            cxp = int(round(x_full[global_idx] - patch_left))
+            cyp = int(round(y_full[global_idx] - patch_top))
             pdraw = ImageDraw.Draw(patch_img)
-            np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-            np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
-            pdraw.line(local_xy_list[: global_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy_buffer[global_idx]
             r = 6
             pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
@@ -1554,7 +1631,7 @@ def generate_gpx_video(
             # Recadrage EXACT viewport
             view_left = int(round(patch_w / 2.0 - mw / 2.0))
             view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh)).convert("RGB")
 
             # Collage final
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
@@ -1860,7 +1937,12 @@ def render_first_frame_image(
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
+        path_full_img = build_full_path_image(
+            (width_large, height_large), global_xy, map_path_c, 3
+        )
+        path_progress_img, _ = init_path_progress_image(
+            (width_large, height_large), global_xy, current_idx, map_current_path_c, 4
+        )
 
         headings = []
         for i in range(total_frames):
@@ -1889,7 +1971,8 @@ def render_first_frame_image(
         yc = float(y_full[current_idx])
         patch_left = int(round(xc - patch_w / 2.0))
         patch_top = int(round(yc - patch_h / 2.0))
-        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+        patch_img = Image.new("RGBA", (patch_w, patch_h), (*bg_c, 255))
+        crop_box = None
 
         src_left = max(0, patch_left)
         src_top = max(0, patch_top)
@@ -1900,14 +1983,14 @@ def render_first_frame_image(
             dest_x = src_left - patch_left
             dest_y = src_top - patch_top
             patch_img.paste(crop, (dest_x, dest_y))
+            crop_box = (src_left, src_top, src_right, src_bottom)
+            composite_paths_on_patch(
+                patch_img, path_full_img, path_progress_img, crop_box, (dest_x, dest_y)
+            )
 
         pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[: current_idx + 1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[current_idx]
+        cxp = int(round(x_full[current_idx] - patch_left))
+        cyp = int(round(y_full[current_idx] - patch_top))
         r = 6
         pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
 
@@ -1925,7 +2008,7 @@ def render_first_frame_image(
         )
         view_left = int(round(patch_w / 2.0 - mw / 2.0))
         view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh)).convert("RGB")
 
         frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
 
