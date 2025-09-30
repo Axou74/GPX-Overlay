@@ -76,6 +76,11 @@ PACE_GRAPH_MAX = 8.0
 # Durée de lissage (secondes) par défaut appliquée aux données des graphes
 DEFAULT_GRAPH_SMOOTHING_SECONDS = 20.0
 
+# Etats internes pour les animations des widgets
+WIDGET_ANIMATION_STATE = {
+    "heart": {"phase": 0.0, "fps": float(DEFAULT_FPS)},
+}
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -103,6 +108,34 @@ DEFAULT_ELEMENT_CONFIGS = {
         "y": MARGIN,
         "width": 300,
         "height": 300,
+    },
+    "Widget FC (cœur)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 140,
+        "width": 240,
+        "height": 60,
+    },
+    "Widget Pente (angle)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 205,
+        "width": 240,
+        "height": 60,
+    },
+    "Widget Distance (progression)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 270,
+        "width": 240,
+        "height": 60,
+    },
+    "Widget Allure (mascotte)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 335,
+        "width": 240,
+        "height": 60,
     },
     "Profil Altitude": {
         "visible": True,
@@ -1167,6 +1200,304 @@ def draw_compass_tape(draw, heading_deg: float, area: dict, font,
     y2 = y1 - marker_len                       # vers le haut
     draw.line([(cx, y2), (cx, y1)], fill=center_color, width=4)
 
+
+def _scaled_color(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, int(c * factor))) for c in color)
+
+
+def draw_widget_fc(draw, bpm, area, font, text_color):
+    if not is_area_visible(area):
+        return
+
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    margin = max(4, int(min(w, h) * 0.12))
+    base_size = max(12, min(h - 2 * margin, int(w * 0.35)))
+
+    bpm_value = bpm if bpm is not None and np.isfinite(bpm) and bpm > 0 else None
+    phase_info = WIDGET_ANIMATION_STATE.setdefault("heart", {"phase": 0.0, "fps": float(DEFAULT_FPS)})
+    phase = float(phase_info.get("phase", 0.0))
+    fps = max(1.0, float(phase_info.get("fps", DEFAULT_FPS)))
+
+    if bpm_value is None:
+        scale = 1.0
+        phase_info["phase"] = 0.0
+        bpm_label = "—"
+    else:
+        scale = 1.0 + 0.12 * math.sin(phase)
+        freq = float(bpm_value) / 60.0
+        phase_info["phase"] = (phase + 2.0 * math.pi * freq / fps) % (2.0 * math.pi)
+        bpm_label = f"{int(round(bpm_value))} bpm"
+
+    heart_size = int(max(10, min(h - 2 * margin, base_size * scale)))
+    heart_left = x + margin
+    heart_top = y + int((h - heart_size) / 2)
+
+    tri_points = [
+        (heart_left + heart_size * 0.10, heart_top + heart_size * 0.45),
+        (heart_left + heart_size * 0.90, heart_top + heart_size * 0.45),
+        (heart_left + heart_size * 0.50, heart_top + heart_size * 0.97),
+    ]
+    draw.polygon(tri_points, fill=(255, 0, 0))
+
+    left_box = (
+        heart_left + heart_size * 0.00,
+        heart_top + heart_size * 0.20,
+        heart_left + heart_size * 0.55,
+        heart_top + heart_size * 0.70,
+    )
+    right_box = (
+        heart_left + heart_size * 0.45,
+        heart_top + heart_size * 0.20,
+        heart_left + heart_size * 1.00,
+        heart_top + heart_size * 0.70,
+    )
+    draw.ellipse(left_box, fill=(255, 0, 0))
+    draw.ellipse(right_box, fill=(255, 0, 0))
+
+    label_text = "FC"
+    label_bbox = draw.textbbox((0, 0), label_text, font=font)
+    bpm_bbox = draw.textbbox((0, 0), bpm_label, font=font)
+    label_height = label_bbox[3] - label_bbox[1]
+    text_y = heart_top + max(0, (heart_size - label_height - (bpm_bbox[3] - bpm_bbox[1])) // 2)
+
+    text_x = heart_left + heart_size + margin
+    draw.text((text_x, text_y), label_text, font=font, fill=text_color)
+    draw.text((text_x, text_y + label_height + 4), bpm_label, font=font, fill=text_color)
+
+
+def draw_widget_slope(draw, slope_pct, area, font, text_color):
+    if not is_area_visible(area):
+        return
+
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    margin = max(4, int(min(w, h) * 0.12))
+    gauge_size = int(max(24, min(h - 2 * margin, w * 0.45)))
+    gx = x + margin
+    gy = y + int((h - gauge_size) / 2)
+    bbox = (gx, gy, gx + gauge_size, gy + gauge_size)
+
+    rim_color = _scaled_color(text_color, 0.4)
+    draw.arc(bbox, start=210, end=-30, fill=rim_color, width=3)
+
+    cx = gx + gauge_size / 2.0
+    cy = gy + gauge_size / 2.0
+
+    for tick_deg in (-30, -15, 0, 15, 30):
+        angle = math.radians(tick_deg)
+        inner = gauge_size * 0.28
+        outer = gauge_size * 0.46
+        x1 = cx + math.cos(angle) * inner
+        y1 = cy - math.sin(angle) * inner
+        x2 = cx + math.cos(angle) * outer
+        y2 = cy - math.sin(angle) * outer
+        draw.line([(x1, y1), (x2, y2)], fill=rim_color, width=2 if tick_deg == 0 else 1)
+
+    slope_val = slope_pct if slope_pct is not None and np.isfinite(slope_pct) else 0.0
+    slope_text = "—" if slope_pct is None or not np.isfinite(slope_pct) else f"{slope_pct:+.1f} %"
+    slope_angle_deg = math.degrees(math.atan(float(slope_val) / 100.0)) if np.isfinite(slope_val) else 0.0
+    angle_text = "—" if slope_pct is None or not np.isfinite(slope_pct) else f"{slope_angle_deg:+.1f}°"
+
+    clamped_angle = max(-30.0, min(30.0, slope_angle_deg))
+    angle_rad = math.radians(clamped_angle)
+    needle_len = gauge_size * 0.48
+    x_end = cx + math.cos(angle_rad) * needle_len
+    y_end = cy - math.sin(angle_rad) * needle_len
+    draw.line([(cx, cy), (x_end, y_end)], fill=_scaled_color(text_color, 0.9), width=3)
+    draw.ellipse((cx - 4, cy - 4, cx + 4, cy + 4), fill=text_color)
+
+    label = "Pente"
+    label_bbox = draw.textbbox((0, 0), label, font=font)
+    info_text = f"{slope_text} / {angle_text}"
+    info_bbox = draw.textbbox((0, 0), info_text, font=font)
+    text_x = gx + gauge_size + margin
+    text_y = y + (h - (label_bbox[3] - label_bbox[1]) - (info_bbox[3] - info_bbox[1]) - 4) / 2.0
+    draw.text((text_x, text_y), label, font=font, fill=text_color)
+    draw.text((text_x, text_y + (label_bbox[3] - label_bbox[1]) + 4), info_text, font=font, fill=text_color)
+
+
+def draw_widget_distance(draw, dist_now_m, dist_total_m, area, font, text_color):
+    if not is_area_visible(area):
+        return
+
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    margin = max(6, int(min(w, h) * 0.12))
+    bar_height = int(max(10, h * 0.35))
+    bar_x0 = x + margin
+    bar_x1 = x + w - margin
+    bar_y1 = y + h - margin
+    bar_y0 = bar_y1 - bar_height
+
+    total = dist_total_m if dist_total_m is not None and dist_total_m > 0 else None
+    current = dist_now_m if dist_now_m is not None and np.isfinite(dist_now_m) else 0.0
+    if total is None or not np.isfinite(total) or total <= 0:
+        progress = 0.0
+        dist_text = "— / — km"
+        percent_text = "—"
+    else:
+        progress = max(0.0, min(1.0, float(current) / float(total)))
+        dist_text = f"{current / 1000.0:.2f} / {total / 1000.0:.2f} km"
+        percent_text = f"{int(round(progress * 100.0))}%"
+
+    bg_color = (70, 70, 70)
+    fill_color = (0, 200, 255)
+    draw.rectangle((bar_x0, bar_y0, bar_x1, bar_y1), fill=bg_color)
+    fill_x1 = bar_x0 + int(round((bar_x1 - bar_x0) * progress))
+    draw.rectangle((bar_x0, bar_y0, fill_x1, bar_y1), fill=fill_color)
+    draw.rectangle((bar_x0, bar_y0, bar_x1, bar_y1), outline=_scaled_color(text_color, 0.6), width=2)
+
+    percent_bbox = draw.textbbox((0, 0), percent_text, font=font)
+    pct_w = percent_bbox[2] - percent_bbox[0]
+    pct_h = percent_bbox[3] - percent_bbox[1]
+    pct_x = bar_x0 + (bar_x1 - bar_x0 - pct_w) / 2.0
+    pct_y = bar_y0 + (bar_height - pct_h) / 2.0
+    draw.text((pct_x, pct_y), percent_text, font=font, fill=text_color)
+
+    label = "Distance"
+    label_bbox = draw.textbbox((0, 0), label, font=font)
+    draw.text((x + margin, y + margin - 2), label, font=font, fill=text_color)
+
+    text_bbox = draw.textbbox((0, 0), dist_text, font=font)
+    text_w = text_bbox[2] - text_bbox[0]
+    draw.text((x + w - margin - text_w, y + margin - 2), dist_text, font=font, fill=text_color)
+
+
+def draw_widget_pace_mascot(draw, pace_minpk, area, font, text_color):
+    if not is_area_visible(area):
+        return
+
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    margin = max(6, int(min(w, h) * 0.12))
+    icon_size = int(max(24, min(h - 2 * margin, w * 0.35)))
+    icon_left = x + margin
+    icon_top = y + int((h - icon_size) / 2)
+    icon_right = icon_left + icon_size
+    icon_bottom = icon_top + icon_size
+
+    if pace_minpk is None or not np.isfinite(pace_minpk):
+        pace_value = float("inf")
+        pace_label = "Allure"
+        mascot = "neutral"
+    else:
+        pace_value = float(pace_minpk)
+        if pace_value < 4.5:
+            pace_label = "Rapide"
+            mascot = "rabbit"
+        elif pace_value > 6.0:
+            pace_label = "Lente"
+            mascot = "turtle"
+        else:
+            pace_label = "Moyenne"
+            mascot = "neutral"
+
+    pace_text = format_pace_mmss(pace_value) if np.isfinite(pace_value) else "—"
+    shadow_color = _scaled_color(text_color, 0.5)
+
+    if mascot == "turtle":
+        shell = (
+            icon_left + icon_size * 0.10,
+            icon_top + icon_size * 0.35,
+            icon_right - icon_size * 0.20,
+            icon_bottom - icon_size * 0.10,
+        )
+        draw.ellipse(shell, fill=text_color)
+        inner = (
+            shell[0] + icon_size * 0.10,
+            shell[1] + icon_size * 0.08,
+            shell[2] - icon_size * 0.10,
+            shell[3] - icon_size * 0.10,
+        )
+        draw.ellipse(inner, fill=shadow_color)
+        head = (
+            icon_right - icon_size * 0.28,
+            icon_top + icon_size * 0.45,
+            icon_right,
+            icon_top + icon_size * 0.70,
+        )
+        draw.ellipse(head, fill=text_color)
+        leg_h = icon_size * 0.15
+        for offset in (0.18, 0.40, 0.62):
+            lx0 = icon_left + icon_size * offset
+            draw.rectangle((lx0, icon_bottom - leg_h, lx0 + icon_size * 0.10, icon_bottom), fill=text_color)
+        draw.polygon(
+            [
+                (icon_left + icon_size * 0.05, icon_top + icon_size * 0.55),
+                (icon_left + icon_size * 0.12, icon_top + icon_size * 0.65),
+                (icon_left + icon_size * 0.02, icon_top + icon_size * 0.68),
+            ],
+            fill=text_color,
+        )
+    elif mascot == "rabbit":
+        body = (
+            icon_left + icon_size * 0.25,
+            icon_top + icon_size * 0.35,
+            icon_right,
+            icon_bottom,
+        )
+        draw.ellipse(body, fill=text_color)
+        head = (
+            icon_left + icon_size * 0.05,
+            icon_top + icon_size * 0.35,
+            icon_left + icon_size * 0.45,
+            icon_top + icon_size * 0.75,
+        )
+        draw.ellipse(head, fill=text_color)
+        ear1 = (
+            icon_left + icon_size * 0.10,
+            icon_top,
+            icon_left + icon_size * 0.20,
+            icon_top + icon_size * 0.45,
+        )
+        ear2 = (
+            icon_left + icon_size * 0.24,
+            icon_top + icon_size * 0.05,
+            icon_left + icon_size * 0.34,
+            icon_top + icon_size * 0.50,
+        )
+        draw.rectangle(ear1, fill=text_color)
+        draw.rectangle(ear2, fill=text_color)
+        draw.ellipse(
+            (
+                body[0] + icon_size * 0.10,
+                body[1] + icon_size * 0.10,
+                body[2] - icon_size * 0.10,
+                body[3] - icon_size * 0.10,
+            ),
+            fill=shadow_color,
+        )
+    else:
+        draw.ellipse((icon_left, icon_top, icon_right, icon_bottom), outline=text_color, width=3)
+        draw.ellipse(
+            (
+                icon_left + icon_size * 0.25,
+                icon_top + icon_size * 0.25,
+                icon_right - icon_size * 0.25,
+                icon_bottom - icon_size * 0.25,
+            ),
+            outline=shadow_color,
+            width=2,
+        )
+        draw.line(
+            (
+                icon_left + icon_size * 0.30,
+                icon_top + icon_size * 0.65,
+                icon_right - icon_size * 0.30,
+                icon_top + icon_size * 0.65,
+            ),
+            fill=shadow_color,
+            width=3,
+        )
+
+    title_text = "Allure"
+    title_bbox = draw.textbbox((0, 0), title_text, font=font)
+    info_text = f"{pace_label} • {pace_text}"
+    info_bbox = draw.textbbox((0, 0), info_text, font=font)
+    text_x = icon_right + margin
+    total_text_height = (title_bbox[3] - title_bbox[1]) + (info_bbox[3] - info_bbox[1]) + 4
+    text_y = y + (h - total_text_height) / 2.0
+    draw.text((text_x, text_y), title_text, font=font, fill=text_color)
+    draw.text((text_x, text_y + (title_bbox[3] - title_bbox[1]) + 4), info_text, font=font, fill=text_color)
+
+
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
     bg_c = (color_configs.get("background", rgb_to_hex(BG_COLOR)) if color_configs else rgb_to_hex(BG_COLOR))
     grid_color = (50, 50, 50)
@@ -1348,6 +1679,10 @@ def generate_gpx_video(
 
     # Zones UI
     map_area = element_configs.get("Carte", {})
+    widget_fc_area = element_configs.get("Widget FC (cœur)", {})
+    widget_slope_area = element_configs.get("Widget Pente (angle)", {})
+    widget_dist_area = element_configs.get("Widget Distance (progression)", {})
+    widget_pace_area = element_configs.get("Widget Allure (mascotte)", {})
     elev_area = element_configs.get("Profil Altitude", {})
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
@@ -1498,6 +1833,10 @@ def generate_gpx_video(
             smoothed_angles = np.arctan2(averages.imag, averages.real)
 
         # Rendu images -> flux vidéo
+        WIDGET_ANIMATION_STATE.setdefault("heart", {"phase": 0.0, "fps": float(fps)})
+        WIDGET_ANIMATION_STATE["heart"]["phase"] = 0.0
+        WIDGET_ANIMATION_STATE["heart"]["fps"] = float(fps)
+
         last_heading_deg = (
             math.degrees(smoothed_angles[clip_start_frame])
             if total_samples
@@ -1622,6 +1961,25 @@ def generate_gpx_video(
                 pace_now = float(interp_pace[global_idx])
                 hr_now = float(interp_hrs[global_idx]) if np.isfinite(interp_hrs[global_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
+
+            if widget_fc_area.get("visible", False):
+                bpm_val = float(interp_hrs[global_idx]) if np.isfinite(interp_hrs[global_idx]) else None
+                draw_widget_fc(draw, bpm_val, widget_fc_area, font_medium, text_c)
+            if widget_slope_area.get("visible", False):
+                slope_val = float(interp_slopes[global_idx]) if np.isfinite(interp_slopes[global_idx]) else None
+                draw_widget_slope(draw, slope_val, widget_slope_area, font_medium, text_c)
+            if widget_dist_area.get("visible", False):
+                draw_widget_distance(
+                    draw,
+                    float(interp_dists[global_idx]),
+                    float(interp_dists[-1]) if interp_dists.size else 0.0,
+                    widget_dist_area,
+                    font_medium,
+                    text_c,
+                )
+            if widget_pace_area.get("visible", False):
+                pace_val = float(interp_pace[global_idx]) if np.isfinite(interp_pace[global_idx]) else None
+                draw_widget_pace_mascot(draw, pace_val, widget_pace_area, font_medium, text_c)
 
             writer.append_data(np.array(frame_img))
             _progress(frame_count + 1)
@@ -1750,6 +2108,10 @@ def render_first_frame_image(
     interp_dists = data["interp_dists"]
 
     map_area = element_configs.get("Carte", {})
+    widget_fc_area = element_configs.get("Widget FC (cœur)", {})
+    widget_slope_area = element_configs.get("Widget Pente (angle)", {})
+    widget_dist_area = element_configs.get("Widget Distance (progression)", {})
+    widget_pace_area = element_configs.get("Widget Allure (mascotte)", {})
     elev_area = element_configs.get("Profil Altitude", {})
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
@@ -1823,6 +2185,9 @@ def render_first_frame_image(
 
     frame_img = Image.new("RGB", resolution, bg_c)
     draw = ImageDraw.Draw(frame_img)
+    WIDGET_ANIMATION_STATE.setdefault("heart", {"phase": 0.0, "fps": float(fps)})
+    WIDGET_ANIMATION_STATE["heart"]["phase"] = 0.0
+    WIDGET_ANIMATION_STATE["heart"]["fps"] = float(fps)
     current_idx = clip_start_frame
     heading_deg = 0.0
 
@@ -1997,6 +2362,25 @@ def render_first_frame_image(
         pace_now = float(interp_pace[current_idx])
         hr_now = float(interp_hrs[current_idx]) if np.isfinite(interp_hrs[current_idx]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
+
+    if widget_fc_area.get("visible", False):
+        bpm_val = float(interp_hrs[current_idx]) if np.isfinite(interp_hrs[current_idx]) else None
+        draw_widget_fc(draw, bpm_val, widget_fc_area, font_medium, text_c)
+    if widget_slope_area.get("visible", False):
+        slope_val = float(interp_slopes[current_idx]) if np.isfinite(interp_slopes[current_idx]) else None
+        draw_widget_slope(draw, slope_val, widget_slope_area, font_medium, text_c)
+    if widget_dist_area.get("visible", False):
+        draw_widget_distance(
+            draw,
+            float(interp_dists[current_idx]),
+            float(interp_dists[-1]) if interp_dists.size else 0.0,
+            widget_dist_area,
+            font_medium,
+            text_c,
+        )
+    if widget_pace_area.get("visible", False):
+        pace_val = float(interp_pace[current_idx]) if np.isfinite(interp_pace[current_idx]) else None
+        draw_widget_pace_mascot(draw, pace_val, widget_pace_area, font_medium, text_c)
 
     return frame_img
 
