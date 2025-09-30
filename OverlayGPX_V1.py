@@ -169,6 +169,14 @@ DEFAULT_ELEMENT_CONFIGS = {
         "width": 368,
         "height": INFO_TEXT_HEIGHT,  # 7 lignes : Vitesse, Altitude, Distance, Heure, Pente, Allure, FC
     },
+    "Widget Distance (progression)": {
+    "visible": True,
+    "x": RIGHT_COLUMN_X,   # au-dessus des graphes à droite
+    "y": 360,              # position par défaut compacte
+    "width": RIGHT_COLUMN_WIDTH,
+    "height": 40,          # sera recalculée au besoin
+    },
+
 }
 
 # ---------- Utils GPX & maths ----------
@@ -1167,6 +1175,36 @@ def draw_compass_tape(draw, heading_deg: float, area: dict, font,
     y2 = y1 - marker_len                       # vers le haut
     draw.line([(cx, y2), (cx, y1)], fill=center_color, width=4)
 
+def draw_widget_distance(draw, dist_now_m: float, dist_total_m: float, area: dict, font, text_color):
+    # Ne rien faire si zone non visible
+    if not is_area_visible(area) or dist_total_m <= 0:
+        return
+    x, y, w, h = area["x"], area["y"], area["width"], area["height"]
+    # Barre: fond discret (gris alpha via teinte sombre du text_color), remplissage “cyan doux”
+    pad = max(2, int(h * 0.15))
+    bar_x0, bar_y0 = x, y
+    bar_w, bar_h = w, max(8, h - pad*2)
+    # fond
+    draw.rectangle([bar_x0, bar_y0, bar_x0 + bar_w, bar_y0 + bar_h],
+                   outline=(80,80,80), width=1)
+    # progression
+    frac = max(0.0, min(1.0, float(dist_now_m)/float(dist_total_m)))
+    prog_w = int(bar_w * frac)
+    fill_col = (0, 200, 255)  # cyan discret
+    draw.rectangle([bar_x0, bar_y0, bar_x0 + prog_w, bar_y0 + bar_h],
+                   fill=fill_col)
+    # Texte “X.XX / Y.YY km  (ZZ%)”
+    km_now = dist_now_m / 1000.0
+    km_tot = dist_total_m / 1000.0
+    pct    = int(round(frac * 100))
+    label  = f"{km_now:.2f} / {km_tot:.2f} km   ({pct}%)"
+    tb = draw.textbbox((0,0), label, font=font)
+    tw = tb[2]-tb[0]; th = tb[3]-tb[1]
+    tx = bar_x0 + (bar_w - tw)//2
+    ty = bar_y0 + (bar_h - th)//2
+    draw.text((tx, ty), label, font=font, fill=text_color)
+
+
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
     bg_c = (color_configs.get("background", rgb_to_hex(BG_COLOR)) if color_configs else rgb_to_hex(BG_COLOR))
     grid_color = (50, 50, 50)
@@ -1610,6 +1648,19 @@ def generate_gpx_video(
             if compass_area.get("visible", False):
                 draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
 
+            # Widget Distance (progression)
+            dist_area = element_configs.get("Widget Distance (progression)", {})
+            if dist_area.get("visible", False):
+                draw_widget_distance(
+                    draw,
+                    float(interp_dists[global_idx]),
+                    float(interp_dists[-1]),
+                    dist_area,
+                    font_medium,
+                    text_c,  # color_configs["text"]
+                )
+
+
             if info_area.get("visible", False):
                 draw_info_text(draw,
                                float(interp_speeds[global_idx]),
@@ -1981,6 +2032,20 @@ def render_first_frame_image(
         )
     if compass_area.get("visible", False):
         draw_compass_tape(draw, heading_deg, compass_area, font_medium, text_c)
+
+    dist_area = element_configs.get("Widget Distance (progression)", {})
+    if dist_area.get("visible", False):
+        draw_widget_distance(
+            draw,
+            float(interp_dists[current_idx]),
+            float(interp_dists[-1]),
+            dist_area,
+            font_medium,
+            text_c,
+        )
+
+
+
     if info_area.get("visible", False):
         draw_info_text(
             draw,
