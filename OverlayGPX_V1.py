@@ -104,6 +104,34 @@ DEFAULT_ELEMENT_CONFIGS = {
         "width": 300,
         "height": 300,
     },
+    "Widget FC (cœur)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 200,
+        "width": 240,
+        "height": 45,
+    },
+    "Widget Pente (angle)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 250,
+        "width": 240,
+        "height": 45,
+    },
+    "Widget Distance (progression)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 300,
+        "width": 240,
+        "height": 45,
+    },
+    "Widget Allure (mascotte)": {
+        "visible": True,
+        "x": RIGHT_COLUMN_X,
+        "y": 350,
+        "width": 240,
+        "height": 45,
+    },
     "Profil Altitude": {
         "visible": True,
         "x": RIGHT_COLUMN_X,
@@ -192,6 +220,22 @@ def hex_to_rgb(value):
 def darken_color(color, factor=0.7):
     r, g, b = hex_to_rgb(color)
     return (int(r * factor), int(g * factor), int(b * factor))
+
+def ensure_rgb_tuple(color) -> tuple[int, int, int]:
+    if isinstance(color, str):
+        return hex_to_rgb(color)
+    if isinstance(color, (list, tuple)) and len(color) >= 3:
+        return (int(color[0]), int(color[1]), int(color[2]))
+    return (255, 255, 255)
+
+def scale_rgb(color: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+    return tuple(max(0, min(255, int(round(c * factor)))) for c in color)
+
+def _get_draw_base_image(draw):
+    return getattr(draw, "_image", None) or getattr(draw, "im", None)
+
+
+_HEART_ANIM_STATE = {"phase": 0.0, "fps": float(DEFAULT_FPS)}
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
@@ -1031,6 +1075,276 @@ def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
     draw.text((draw_area["x"], y0), f"Allure : {pace_txt}", font=font, fill=text_color)
     draw.text((draw_area["x"], y0 + (FONT_SIZE_LARGE + 10)), f"FC : {hr_txt}", font=font, fill=text_color)
 
+
+def _draw_heart_icon(base_size: int) -> Image.Image:
+    size = max(12, int(base_size))
+    heart = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    hd = ImageDraw.Draw(heart)
+    w = float(size)
+    h = float(size)
+    radius = w * 0.22
+    left_center = (w * 0.35, h * 0.35)
+    right_center = (w * 0.65, h * 0.35)
+    hd.ellipse((left_center[0] - radius, left_center[1] - radius,
+                left_center[0] + radius, left_center[1] + radius), fill=(255, 0, 0, 255))
+    hd.ellipse((right_center[0] - radius, right_center[1] - radius,
+                right_center[0] + radius, right_center[1] + radius), fill=(255, 0, 0, 255))
+    hd.polygon([
+        (w * 0.15, h * 0.45),
+        (w * 0.85, h * 0.45),
+        (w * 0.5, h * 0.92),
+    ], fill=(255, 0, 0, 255))
+    return heart
+
+
+def draw_widget_fc(draw, bpm, area, font, text_color):
+    if not area or not area.get("visible", False):
+        return
+    width = int(area.get("width", 0))
+    height = int(area.get("height", 0))
+    if width <= 0 or height <= 0:
+        return
+
+    base_size = max(18, int(min(height, width * 0.4)))
+    heart_img = _draw_heart_icon(base_size)
+    bpm_val = float(bpm) if bpm is not None and np.isfinite(bpm) else None
+
+    global _HEART_ANIM_STATE
+    scale = 1.0
+    if bpm_val is not None and bpm_val > 0.0:
+        fps = max(1.0, float(_HEART_ANIM_STATE.get("fps", DEFAULT_FPS)))
+        phase = float(_HEART_ANIM_STATE.get("phase", 0.0))
+        phase += 2.0 * math.pi * (bpm_val / 60.0) / fps
+        _HEART_ANIM_STATE["phase"] = phase % (2.0 * math.pi)
+        scale = 1.0 + 0.12 * math.sin(phase)
+        bpm_text = f"{bpm_val:.0f} bpm"
+    else:
+        bpm_text = "—"
+
+    scaled_size = max(12, int(round(base_size * scale)))
+    heart_scaled = heart_img.resize((scaled_size, scaled_size), resample=Image.BICUBIC)
+    hx = int(area.get("x", 0) + 8)
+    hy = int(area.get("y", 0) + (height - scaled_size) / 2)
+    base = _get_draw_base_image(draw)
+    if base is not None:
+        base.paste(heart_scaled, (hx, hy), heart_scaled)
+
+    try:
+        tb = draw.textbbox((0, 0), bpm_text, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    except Exception:
+        tw = len(bpm_text) * 8
+        th = getattr(font, "size", 16)
+
+    text_x = int(area.get("x", 0) + base_size + 24)
+    text_y = int(area.get("y", 0) + (height - th) / 2)
+    draw.text((text_x, text_y), bpm_text, font=font, fill=text_color)
+
+
+def draw_widget_slope(draw, slope_pct, area, font, text_color):
+    if not area or not area.get("visible", False):
+        return
+    width = int(area.get("width", 0))
+    height = int(area.get("height", 0))
+    if width <= 0 or height <= 0:
+        return
+
+    slope_val = float(slope_pct) if slope_pct is not None and np.isfinite(slope_pct) else None
+    text_rgb = ensure_rgb_tuple(text_color)
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+
+    gauge_size = max(24, int(min(height * 0.9, width * 0.45)))
+    cx = int(gauge_size / 2 + 10)
+    cy = int(height / 2)
+    radius = int(gauge_size / 2)
+
+    arc_color = (*scale_rgb(text_rgb, 0.45), 180)
+    od.arc((cx - radius, cy - radius, cx + radius, cy + radius), start=210, end=330, fill=arc_color, width=3)
+    od.line((cx - radius, cy, cx + radius, cy), fill=arc_color, width=1)
+
+    angle_deg = None
+    if slope_val is not None:
+        angle_deg = math.degrees(math.atan(slope_val / 100.0))
+        needle_angle = max(-30.0, min(30.0, angle_deg))
+    else:
+        needle_angle = 0.0
+
+    needle_len = radius * 0.85
+    theta = math.radians(needle_angle)
+    nx = cx + needle_len * math.sin(theta)
+    ny = cy - needle_len * math.cos(theta)
+    od.line((cx, cy, nx, ny), fill=(255, 0, 0, 220), width=3)
+    od.ellipse((cx - 3, cy - 3, cx + 3, cy + 3), fill=(*text_rgb, 220))
+
+    base = _get_draw_base_image(draw)
+    if base is not None:
+        base.paste(overlay, (int(area.get("x", 0)), int(area.get("y", 0))), overlay)
+
+    if slope_val is None:
+        slope_text = "— %"
+        angle_text = "—°"
+    else:
+        slope_text = f"{slope_val:+.1f} %"
+        angle_text = f"{angle_deg:+.0f}°"
+
+    combined = f"{slope_text} / {angle_text}"
+    try:
+        tb = draw.textbbox((0, 0), combined, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    except Exception:
+        tw = len(combined) * 8
+        th = getattr(font, "size", 16)
+
+    text_x = int(area.get("x", 0) + gauge_size + 20)
+    text_y = int(area.get("y", 0) + (height - th) / 2)
+    draw.text((text_x, text_y), combined, font=font, fill=text_color)
+
+
+def draw_widget_distance(draw, dist_now_m, dist_total_m, area, font, text_color):
+    if not area or not area.get("visible", False):
+        return
+    width = int(area.get("width", 0))
+    height = int(area.get("height", 0))
+    if width <= 0 or height <= 0:
+        return
+
+    now_val = float(dist_now_m) if dist_now_m is not None else 0.0
+    total_val = float(dist_total_m) if dist_total_m is not None else 0.0
+    ratio = 0.0
+    if total_val > 0.0:
+        ratio = max(0.0, min(1.0, now_val / total_val))
+    text_rgb = ensure_rgb_tuple(text_color)
+
+    overlay = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    od = ImageDraw.Draw(overlay)
+    margin = 10
+    bar_height = max(6, int(height * 0.35))
+    bar_y = int(height * 0.2)
+    bar_x0 = margin
+    bar_x1 = width - margin
+    radius = bar_height // 2
+    bg_color = (*scale_rgb(text_rgb, 0.25), 140)
+    fg_color = (0, 200, 255, 220)
+
+    od.rounded_rectangle((bar_x0, bar_y, bar_x1, bar_y + bar_height), radius=radius, fill=bg_color)
+    fill_width = int(round((bar_x1 - bar_x0) * ratio))
+    if fill_width > 0:
+        od.rounded_rectangle((bar_x0, bar_y, bar_x0 + fill_width, bar_y + bar_height), radius=radius, fill=fg_color)
+
+    pct_text = f"{int(round(ratio * 100))}%"
+    try:
+        tb_pct = od.textbbox((0, 0), pct_text, font=font)
+        pct_w = tb_pct[2] - tb_pct[0]
+        pct_h = tb_pct[3] - tb_pct[1]
+    except Exception:
+        pct_w = len(pct_text) * 8
+        pct_h = getattr(font, "size", 16)
+    pct_x = bar_x0 + (bar_x1 - bar_x0 - pct_w) / 2
+    pct_y = bar_y + (bar_height - pct_h) / 2
+    od.text((pct_x, pct_y), pct_text, font=font, fill=(*text_rgb, 230))
+
+    base = _get_draw_base_image(draw)
+    if base is not None:
+        base.paste(overlay, (int(area.get("x", 0)), int(area.get("y", 0))), overlay)
+
+    if total_val > 0.0:
+        dist_text = f"{now_val / 1000.0:.2f} / {total_val / 1000.0:.2f} km"
+    else:
+        dist_text = "0.00 / 0.00 km"
+    try:
+        tb = draw.textbbox((0, 0), dist_text, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    except Exception:
+        tw = len(dist_text) * 8
+        th = getattr(font, "size", 16)
+    text_x = int(area.get("x", 0) + width - tw)
+    text_y = int(area.get("y", 0) + height - th)
+    draw.text((text_x, text_y), dist_text, font=font, fill=text_color)
+
+
+def _render_pace_icon(category: str, size: int, text_rgb: tuple[int, int, int]) -> Image.Image:
+    size = max(20, int(size))
+    img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    shadow = (*scale_rgb(text_rgb, 0.3), 120)
+    main = (*text_rgb, 220)
+    if category == "fast":
+        body = (size * 0.25, size * 0.45, size * 0.85, size * 0.78)
+        head = (size * 0.65, size * 0.18, size * 0.85, size * 0.38)
+        ear1 = (size * 0.68, size * 0.02, size * 0.75, size * 0.22)
+        ear2 = (size * 0.78, size * 0.04, size * 0.85, size * 0.24)
+        tail = (size * 0.18, size * 0.55, size * 0.32, size * 0.69)
+        d.ellipse(body, fill=shadow)
+        d.ellipse((body[0] + size * 0.04, body[1] + size * 0.04, body[2] - size * 0.04, body[3] - size * 0.04), fill=main)
+        d.ellipse(head, fill=main)
+        d.rounded_rectangle(ear1, radius=size * 0.08, fill=main)
+        d.rounded_rectangle(ear2, radius=size * 0.08, fill=main)
+        d.ellipse(tail, fill=main)
+    elif category == "slow":
+        shell = (size * 0.18, size * 0.35, size * 0.82, size * 0.78)
+        head = (size * 0.78, size * 0.45, size * 0.96, size * 0.63)
+        leg_front = (size * 0.3, size * 0.7, size * 0.4, size * 0.88)
+        leg_back = (size * 0.55, size * 0.7, size * 0.65, size * 0.88)
+        d.ellipse(shell, fill=shadow)
+        d.ellipse((shell[0] + size * 0.05, shell[1] + size * 0.05, shell[2] - size * 0.05, shell[3] - size * 0.05), fill=main)
+        d.ellipse(head, fill=main)
+        d.rectangle(leg_front, fill=main)
+        d.rectangle(leg_back, fill=main)
+    else:
+        body = (size * 0.25, size * 0.25, size * 0.75, size * 0.75)
+        bar = (size * 0.46, size * 0.15, size * 0.54, size * 0.85)
+        d.ellipse(body, fill=shadow)
+        d.ellipse((body[0] + size * 0.05, body[1] + size * 0.05, body[2] - size * 0.05, body[3] - size * 0.05), fill=main)
+        d.rectangle(bar, fill=main)
+    return img
+
+
+def draw_widget_pace_mascot(draw, pace_minpk, area, font, text_color):
+    if not area or not area.get("visible", False):
+        return
+    width = int(area.get("width", 0))
+    height = int(area.get("height", 0))
+    if width <= 0 or height <= 0:
+        return
+
+    text_rgb = ensure_rgb_tuple(text_color)
+    pace_val = float(pace_minpk) if pace_minpk is not None and np.isfinite(pace_minpk) else None
+    if pace_val is None or pace_val > 59:
+        pace_text = "—"
+        category = "neutral"
+    else:
+        pace_text = format_pace_mmss(pace_val)
+        if pace_val < 4.5:
+            category = "fast"
+        elif pace_val > 6.0:
+            category = "slow"
+        else:
+            category = "neutral"
+
+    icon_size = max(24, int(min(height * 0.9, width * 0.45)))
+    icon = _render_pace_icon(category, icon_size, text_rgb)
+    base = _get_draw_base_image(draw)
+    if base is not None:
+        px = int(area.get("x", 0) + 6)
+        py = int(area.get("y", 0) + (height - icon.height) / 2)
+        base.paste(icon, (px, py), icon)
+
+    try:
+        tb = draw.textbbox((0, 0), pace_text, font=font)
+        tw = tb[2] - tb[0]
+        th = tb[3] - tb[1]
+    except Exception:
+        tw = len(pace_text) * 8
+        th = getattr(font, "size", 16)
+
+    text_x = int(area.get("x", 0) + icon_size + 24)
+    text_y = int(area.get("y", 0) + (height - th) / 2)
+    draw.text((text_x, text_y), pace_text, font=font, fill=text_color)
+
 def draw_north_arrow(img, map_area, rotation_deg, color):
     size = 40
     arrow_img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
@@ -1352,6 +1666,10 @@ def generate_gpx_video(
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
     hr_area    = element_configs.get("Profil Cardio", {})
+    widget_fc_area = element_configs.get("Widget FC (cœur)", {})
+    widget_slope_area = element_configs.get("Widget Pente (angle)", {})
+    widget_dist_area = element_configs.get("Widget Distance (progression)", {})
+    widget_pace_area = element_configs.get("Widget Allure (mascotte)", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
     gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
     gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
@@ -1423,6 +1741,12 @@ def generate_gpx_video(
         graph_current_point_c,
         graph_specs,
     )
+
+    total_distance = float(interp_dists[-1]) if interp_dists.size else 0.0
+
+    global _HEART_ANIM_STATE
+    _HEART_ANIM_STATE["phase"] = 0.0
+    _HEART_ANIM_STATE["fps"] = float(fps)
 
     try:
 
@@ -1623,6 +1947,11 @@ def generate_gpx_video(
                 hr_now = float(interp_hrs[global_idx]) if np.isfinite(interp_hrs[global_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
+            draw_widget_fc(draw, float(interp_hrs[global_idx]), widget_fc_area, font_medium, text_c)
+            draw_widget_slope(draw, float(interp_slopes[global_idx]), widget_slope_area, font_medium, text_c)
+            draw_widget_distance(draw, float(interp_dists[global_idx]), total_distance, widget_dist_area, font_medium, text_c)
+            draw_widget_pace_mascot(draw, float(interp_pace[global_idx]), widget_pace_area, font_medium, text_c)
+
             writer.append_data(np.array(frame_img))
             _progress(frame_count + 1)
 
@@ -1754,6 +2083,10 @@ def render_first_frame_image(
     speed_area = element_configs.get("Profil Vitesse", {})
     pace_area  = element_configs.get("Profil Allure", {})
     hr_area    = element_configs.get("Profil Cardio", {})
+    widget_fc_area = element_configs.get("Widget FC (cœur)", {})
+    widget_slope_area = element_configs.get("Widget Pente (angle)", {})
+    widget_dist_area = element_configs.get("Widget Distance (progression)", {})
+    widget_pace_area = element_configs.get("Widget Allure (mascotte)", {})
     gauge_circ_area = element_configs.get("Jauge Vitesse Circulaire", {})
     gauge_lin_area  = element_configs.get("Jauge Vitesse Linéaire", {})
     gauge_cnt_area  = element_configs.get("Compteur de vitesse", {})
@@ -1997,6 +2330,11 @@ def render_first_frame_image(
         pace_now = float(interp_pace[current_idx])
         hr_now = float(interp_hrs[current_idx]) if np.isfinite(interp_hrs[current_idx]) else None
         draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
+
+    draw_widget_fc(draw, float(interp_hrs[current_idx]), widget_fc_area, font_medium, text_c)
+    draw_widget_slope(draw, float(interp_slopes[current_idx]), widget_slope_area, font_medium, text_c)
+    draw_widget_distance(draw, float(interp_dists[current_idx]), total_distance, widget_dist_area, font_medium, text_c)
+    draw_widget_pace_mascot(draw, float(interp_pace[current_idx]), widget_pace_area, font_medium, text_c)
 
     return frame_img
 
