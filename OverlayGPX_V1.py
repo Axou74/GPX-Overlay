@@ -1435,7 +1435,13 @@ def generate_gpx_video(
 
     try:
 
-        writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
+        writer = imageio.get_writer(
+            output_filename,
+            fps=fps,
+            codec="libx264",
+            macro_block_size=1,
+            ffmpeg_params=["-preset", "veryfast"],
+        )
 
         # Calcul du zoom de base (sur grande image), avec offset UI
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
@@ -1476,7 +1482,20 @@ def generate_gpx_video(
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
+
+        base_map_with_path = base_map_img_large.convert("RGBA")
+        base_draw = ImageDraw.Draw(base_map_with_path)
+        full_path_points = [tuple(pt) for pt in global_xy.tolist()]
+        if len(full_path_points) >= 2:
+            base_draw.line(full_path_points, fill=(*map_path_c, 255), width=3)
+
+        progress_overlay = Image.new("RGBA", base_map_with_path.size, (0, 0, 0, 0))
+        progress_draw = ImageDraw.Draw(progress_overlay)
+        if clip_start_frame >= 1:
+            progressed = [tuple(pt) for pt in global_xy[: clip_start_frame + 1].tolist()]
+            if len(progressed) >= 2:
+                progress_draw.line(progressed, fill=(*map_current_path_c, 255), width=4)
+        last_progress_idx = max(0, clip_start_frame)
 
         # Tête lissée (pour rotation)
         if total_samples == 0:
@@ -1523,28 +1542,39 @@ def generate_gpx_video(
             xc = float(x_full[global_idx]); yc = float(y_full[global_idx])
             patch_left = int(round(xc - patch_w / 2.0))
             patch_top  = int(round(yc - patch_h / 2.0))
-            patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+            if global_idx > last_progress_idx:
+                progress_draw.line(
+                    [tuple(global_xy[last_progress_idx]), tuple(global_xy[global_idx])],
+                    fill=(*map_current_path_c, 255),
+                    width=4,
+                )
+                last_progress_idx = global_idx
+
+            patch_img = Image.new("RGBA", (patch_w, patch_h), (*bg_c, 255))
 
             src_left   = max(0, patch_left)
             src_top    = max(0, patch_top)
-            src_right  = min(base_map_img_large.width,  patch_left + patch_w)
-            src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
+            src_right  = min(base_map_with_path.width,  patch_left + patch_w)
+            src_bottom = min(base_map_with_path.height, patch_top  + patch_h)
             if src_right > src_left and src_bottom > src_top:
-                crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+                crop_box = (src_left, src_top, src_right, src_bottom)
                 dest_x = src_left - patch_left
                 dest_y = src_top  - patch_top
-                patch_img.paste(crop, (dest_x, dest_y))
+                base_crop = base_map_with_path.crop(crop_box)
+                patch_img.paste(base_crop, (dest_x, dest_y))
 
-            # Trace + progression + point (dans le patch)
-            pdraw = ImageDraw.Draw(patch_img)
-            np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-            np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-            pdraw.line(local_xy_list, fill=map_path_c, width=3)
-            pdraw.line(local_xy_list[: global_idx + 1], fill=map_current_path_c, width=4)
-            cxp, cyp = local_xy_buffer[global_idx]
+                progress_crop = progress_overlay.crop(crop_box)
+                if progress_crop.getbbox():
+                    patch_img.alpha_composite(progress_crop, (dest_x, dest_y))
+
             r = 6
-            pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+            cx_local = int(round(global_xy[global_idx][0] - patch_left))
+            cy_local = int(round(global_xy[global_idx][1] - patch_top))
+            point_draw = ImageDraw.Draw(patch_img)
+            point_draw.ellipse(
+                (cx_local - r, cy_local - r, cx_local + r, cy_local + r),
+                fill=(*map_current_point_c, 255),
+            )
 
             # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[global_idx])
@@ -1558,12 +1588,13 @@ def generate_gpx_video(
                 resample=Image.BICUBIC,
                 expand=False,
                 center=(patch_w / 2.0, patch_h / 2.0),
+                fillcolor=(*bg_c, 255),
             )
 
             # Recadrage EXACT viewport
             view_left = int(round(patch_w / 2.0 - mw / 2.0))
             view_top  = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+            view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh)).convert("RGB")
 
             # Collage final
             frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
@@ -1645,7 +1676,7 @@ def generate_gpx_video(
                 hr_now = float(interp_hrs[global_idx]) if np.isfinite(interp_hrs[global_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
-            writer.append_data(np.array(frame_img))
+            writer.append_data(np.asarray(frame_img))
             _progress(frame_count + 1)
 
 
@@ -1882,56 +1913,73 @@ def render_first_frame_image(
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
         global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
-        local_xy_buffer = np.empty_like(global_xy)
 
-        headings = []
-        for i in range(total_frames):
-            if i < total_frames - 1:
-                dx = x_full[i + 1] - x_full[i]
-                dy = y_full[i + 1] - y_full[i]
-            else:
-                dx = x_full[i] - x_full[i - 1]
-                dy = y_full[i] - y_full[i - 1]
-            if abs(dx) > 1e-9 or abs(dy) > 1e-9:
-                headings.append(math.atan2(dx, -dy))
-            else:
-                headings.append(0.0)
-        complex_raw = np.exp(1j * np.array(headings))
+        base_map_with_path = base_map_img_large.convert("RGBA")
+        base_draw = ImageDraw.Draw(base_map_with_path)
+        full_path_points = [tuple(pt) for pt in global_xy.tolist()]
+        if len(full_path_points) >= 2:
+            base_draw.line(full_path_points, fill=(*map_path_c, 255), width=3)
+
+        progress_overlay = Image.new("RGBA", base_map_with_path.size, (0, 0, 0, 0))
+        progress_draw = ImageDraw.Draw(progress_overlay)
+        if current_idx >= 1:
+            progressed = [tuple(pt) for pt in global_xy[: current_idx + 1].tolist()]
+            if len(progressed) >= 2:
+                progress_draw.line(progressed, fill=(*map_current_path_c, 255), width=4)
+
+        dx = np.zeros(total_frames, dtype=float)
+        dy = np.zeros(total_frames, dtype=float)
+        if total_frames > 1:
+            dx[:-1] = np.diff(x_full)
+            dy[:-1] = np.diff(y_full)
+            dx[-1] = x_full[-1] - x_full[-2]
+            dy[-1] = y_full[-1] - y_full[-2]
+        headings = np.zeros(total_frames, dtype=float)
+        non_zero = (np.abs(dx) > 1e-9) | (np.abs(dy) > 1e-9)
+        headings[non_zero] = np.arctan2(dx[non_zero], -dy[non_zero])
+
+        complex_raw = np.exp(1j * headings)
         win_sizes = np.clip((15 - interp_speeds).astype(int), 3, 15)
-        smoothed_angles = []
-        for idx in range(total_frames):
-            w = int(win_sizes[idx])
-            half_w = w // 2
-            a = max(0, idx - half_w)
-            b = min(total_frames, idx + half_w + 1)
-            avg = np.mean(complex_raw[a:b])
-            smoothed_angles.append(math.atan2(avg.imag, avg.real))
+        half_windows = win_sizes // 2
+        indices = np.arange(total_frames)
+        start_idx = np.maximum(indices - half_windows, 0)
+        end_idx = np.minimum(indices + half_windows + 1, total_frames)
+
+        cumulative = np.concatenate(([0.0 + 0.0j], np.cumsum(complex_raw)))
+        counts = (end_idx - start_idx).astype(float)
+        counts[counts == 0] = 1.0
+        averages = (cumulative[end_idx] - cumulative[start_idx]) / counts
+        smoothed_angles = np.arctan2(averages.imag, averages.real)
 
         xc = float(x_full[current_idx])
         yc = float(y_full[current_idx])
         patch_left = int(round(xc - patch_w / 2.0))
         patch_top = int(round(yc - patch_h / 2.0))
-        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+        patch_img = Image.new("RGBA", (patch_w, patch_h), (*bg_c, 255))
 
         src_left = max(0, patch_left)
         src_top = max(0, patch_top)
-        src_right = min(base_map_img_large.width, patch_left + patch_w)
-        src_bottom = min(base_map_img_large.height, patch_top + patch_h)
+        src_right = min(base_map_with_path.width, patch_left + patch_w)
+        src_bottom = min(base_map_with_path.height, patch_top + patch_h)
         if src_right > src_left and src_bottom > src_top:
-            crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+            crop_box = (src_left, src_top, src_right, src_bottom)
             dest_x = src_left - patch_left
             dest_y = src_top - patch_top
-            patch_img.paste(crop, (dest_x, dest_y))
+            base_crop = base_map_with_path.crop(crop_box)
+            patch_img.paste(base_crop, (dest_x, dest_y))
 
-        pdraw = ImageDraw.Draw(patch_img)
-        np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
-        np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
-        pdraw.line(local_xy_list, fill=map_path_c, width=3)
-        pdraw.line(local_xy_list[: current_idx + 1], fill=map_current_path_c, width=4)
-        cxp, cyp = local_xy_buffer[current_idx]
+            progress_crop = progress_overlay.crop(crop_box)
+            if progress_crop.getbbox():
+                patch_img.alpha_composite(progress_crop, (dest_x, dest_y))
+
         r = 6
-        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+        cx_local = int(round(global_xy[current_idx][0] - patch_left))
+        cy_local = int(round(global_xy[current_idx][1] - patch_top))
+        point_draw = ImageDraw.Draw(patch_img)
+        point_draw.ellipse(
+            (cx_local - r, cy_local - r, cx_local + r, cy_local + r),
+            fill=(*map_current_point_c, 255),
+        )
 
         speed_kmh0 = float(interp_speeds[current_idx])
         heading_deg = (
@@ -1944,10 +1992,11 @@ def render_first_frame_image(
             resample=Image.BICUBIC,
             expand=False,
             center=(patch_w / 2.0, patch_h / 2.0),
+            fillcolor=(*bg_c, 255),
         )
         view_left = int(round(patch_w / 2.0 - mw / 2.0))
         view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
-        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
+        view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh)).convert("RGB")
 
         frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
 
