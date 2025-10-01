@@ -654,35 +654,6 @@ class GraphTransformer:
         y = self.draw_y + int((self.data_max - value) / (data_range + 1e-10) * self.draw_height)
         return (x, y)
 
-def draw_graph(
-    draw, path_coords, current_index, min_val, max_val, draw_area, font, title, unit,
-    base_color, current_point_color, text_color, point_size: int = 4,
-):
-    # Graduations en ordonnée sous la courbe
-    nb_ticks = 4
-    for i in range(nb_ticks + 1):
-        val = min_val + (max_val - min_val) * i / nb_ticks
-        y = draw_area["y"] + int((max_val - val) / ((max_val - min_val) + 1e-10) * draw_area["height"])
-        draw.line([(draw_area["x"], y), (draw_area["x"] + draw_area["width"], y)], fill=(80, 80, 80), width=1)
-        val_str = f"{val:.0f}"
-        text_bbox = draw.textbbox((0, 0), val_str, font=font)
-        text_w = text_bbox[2] - text_bbox[0]
-        text_h = text_bbox[3] - text_bbox[1]
-        draw.text((draw_area["x"] - text_w - 10, y - text_h / 2), val_str, font=font, fill=text_color)
-    future_color = darken_color(base_color, 0.8)
-    draw.line(path_coords, fill=future_color, width=4)
-    if current_index < len(path_coords):
-        draw.line(path_coords[: current_index + 1], fill=base_color, width=5)
-        current_xy = path_coords[current_index]
-        draw.ellipse(
-            (current_xy[0]-point_size, current_xy[1]-point_size, current_xy[0]+point_size, current_xy[1]+point_size),
-            fill=current_point_color,
-        )
-
-    # Légendes min/max (entiers pour rester simple)
-    draw.text((draw_area["x"], draw_area["y"] + draw_area["height"] + 10), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
-    draw.text((draw_area["x"] + draw_area["width"] - 200, draw_area["y"] + draw_area["height"] + 10), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
-
 
 def is_area_visible(area: dict | None) -> bool:
     """Retourne True si la zone est visible et possède des dimensions non nulles."""
@@ -716,7 +687,7 @@ def create_graph_background_image(
     width = int(draw_area.get("width", 0))
     height = int(draw_area.get("height", 0))
 
-    nb_ticks = 4
+    nb_ticks = 2
     for i in range(nb_ticks + 1):
         val = min_val + (max_val - min_val) * i / nb_ticks
         y = y0 + int((max_val - val) / ((max_val - min_val) + 1e-10) * height)
@@ -735,8 +706,8 @@ def create_graph_background_image(
         draw.ellipse((cx - 1, cy - 1, cx + 1, cy + 1), fill=future_color)
 
     text_y = y0 + height + 10
-    draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
-    draw.text((x0 + width - 200, text_y), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
+    #draw.text((x0, text_y), f"Min {title}: {min_val:.0f} {unit}", font=font, fill=text_color)
+    #draw.text((x0 + width - 200, text_y), f"Max {title}: {max_val:.0f} {unit}", font=font, fill=text_color)
 
     return bg_img
 
@@ -2069,8 +2040,8 @@ class GPXVideoApp:
     def __init__(self, master):
         self.master = master
         master.title("Overlay GPX")
-        master.geometry("1650x600")
-        master.minsize(1200, 600)
+        master.geometry("1400x550")
+        master.minsize(1200, 550)
         self.accent_button_style = "TButton"
         try:
             style = ttk.Style(); style.theme_use("clam")
@@ -2391,13 +2362,13 @@ class GPXVideoApp:
 
         headers = ["Élément", "Aff.", "X", "Y", "Largeur"]
         for i, _ in enumerate(headers):
-            scrollable_frame_elements.columnconfigure(i, weight=1 if i in [0, 2, 3, 4] else 0, minsize=50 if i != 0 else 80)
+            scrollable_frame_elements.columnconfigure(i, weight=1 if i in [0, 2, 3, 4] else 0, minsize=70 if i != 0 else 80)
         for col, header_text in enumerate(headers):
             ttk.Label(scrollable_frame_elements, text=header_text).grid(row=0, column=col, padx=2, pady=2, sticky="w" if col == 0 else "nsew")
 
         row_num = 1
         for element_name, defaults in DEFAULT_ELEMENT_CONFIGS.items():
-            ttk.Label(scrollable_frame_elements, text=element_name, wraplength=70).grid(row=row_num, column=0, padx=5, pady=2, sticky="w")
+            ttk.Label(scrollable_frame_elements, text=element_name, wraplength=80).grid(row=row_num, column=0, padx=5, pady=2, sticky="w")
             var = tk.BooleanVar(value=defaults["visible"])
             cb_visible = ttk.Checkbutton(scrollable_frame_elements, variable=var, command=lambda el=element_name: self.handle_element_change(el, "visible"))
             cb_visible.grid(row=row_num, column=1, padx=2, pady=2)
@@ -2423,7 +2394,7 @@ class GPXVideoApp:
                 entry_widget.bind("<FocusOut>", lambda e, el=element_name, k=key: self.handle_element_change(el, k, "entry"))
                 entry_widget.bind("<Return>",  lambda e, el=element_name, k=key: self.handle_element_change(el, k, "entry"))
 
-                slider = ttk.Scale(entry_slider_frame, variable=slider_var, orient=tk.HORIZONTAL, length=150,
+                slider = ttk.Scale(entry_slider_frame, variable=slider_var, orient=tk.HORIZONTAL, length=80,
                                    command=lambda val, el=element_name, k=key: self.handle_element_change(el, k, "slider"))
                 slider.grid(row=0, column=0, sticky="ew", padx=(0, 2))
                 self.element_sliders[element_name][key] = slider
