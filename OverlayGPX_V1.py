@@ -76,6 +76,9 @@ PACE_GRAPH_MAX = 8.0
 # Durée de lissage (secondes) par défaut appliquée aux données des graphes
 DEFAULT_GRAPH_SMOOTHING_SECONDS = 20.0
 
+VERTICAL_BIAS = float(os.getenv("VERTICAL_BIAS", "0.65"))
+DEBUG_ALIGNMENT = bool(int(os.getenv("DEBUG_ALIGNMENT", "0")))
+
 LEFT_COLUMN_WIDTH = 480
 RIGHT_COLUMN_X = 1500
 RIGHT_COLUMN_WIDTH = 400
@@ -494,6 +497,13 @@ def lonlat_to_pixel(lon: float, lat: float, zoom: int):
     siny = math.sin(math.radians(lat))
     y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * n
     return x, y
+
+
+def pixel_to_lonlat(x, y, zoom):
+    n = 256 * (2 ** zoom)
+    lon = x / n * 360.0 - 180.0
+    lat = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    return lon, lat
 
 
 def lonlat_to_pixel_np(lons, lats, zoom: int):
@@ -1228,7 +1238,6 @@ def generate_gpx_video(
     # --- Config interne ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
-    VERTICAL_BIAS = 0.65
 
     # Polices & couleurs
     graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
@@ -1375,8 +1384,6 @@ def generate_gpx_video(
     # BBox brute & centre
     lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
     lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
-    lat_c = (lat_min_raw + lat_max_raw) * 0.5
-    lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
     # Profils (altitude & vitesse)
     elev_min = float(np.min(interp_eles))
@@ -1446,22 +1453,26 @@ def generate_gpx_video(
         # Positions "monde" au zoom choisi
         xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
-        # Etendue, marge et image "large"
+        # Etendue, centre pixel et image "large"
         x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
         y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
         track_w = x_max - x_min; track_h = y_max - y_min
+        cx_px = (x_min + x_max) * 0.5
+        cy_px = (y_min + y_max) * 0.5
+
+        # Centre en degrés dérivé du centre pixel
+        lon_c, lat_c = pixel_to_lonlat(cx_px, cy_px, zoom)
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
         margin_x = patch_w // 2 + 64
         margin_y = patch_h // 2 + 64
-        width_large  = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
+        width_large  = int(min(MAX_LARGE_DIM, max(mw, (x_max - x_min) + 2 * margin_x)))
+        height_large = int(min(MAX_LARGE_DIM, max(mh, (y_max - y_min) + 2 * margin_y)))
 
-        # Coin haut-gauche de l'image "large" basé sur le centre du fond de carte
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
+        # Origine monde alignée sur le centre pixel
+        x0_world = cx_px - width_large / 2.0
+        y0_world = cy_px - height_large / 2.0
 
         # Fond "large"
         try:
@@ -1473,9 +1484,11 @@ def generate_gpx_video(
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
         # Trace dans le repère "large"
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        xs_local = xs_world - x0_world
+        ys_local = ys_world - y0_world
+        x_full = xs_local
+        y_full = ys_local
+        global_xy = np.column_stack((xs_local, ys_local))
         local_xy_buffer = np.empty_like(global_xy)
 
         # Tête lissée (pour rotation)
@@ -1539,12 +1552,12 @@ def generate_gpx_video(
             pdraw = ImageDraw.Draw(patch_img)
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-            local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+            local_xy_list = [(float(pt[0]), float(pt[1])) for pt in local_xy_buffer]
             pdraw.line(local_xy_list, fill=map_path_c, width=3)
             pdraw.line(local_xy_list[: global_idx + 1], fill=map_current_path_c, width=4)
             cxp, cyp = local_xy_buffer[global_idx]
             r = 6
-            pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+            pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
 
             # Rotation patch (cadre fixe)
             speed_kmh = float(interp_speeds[global_idx])
@@ -1566,7 +1579,23 @@ def generate_gpx_video(
             view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
             # Collage final
-            frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+            map_x = int(map_area.get("x", 0))
+            map_y = int(map_area.get("y", 0))
+            frame_img.paste(view, (map_x, map_y))
+            if DEBUG_ALIGNMENT:
+                cx_screen = map_x + mw // 2
+                cy_screen = map_y + int(VERTICAL_BIAS * mh)
+                r_dbg = 6
+                draw.ellipse(
+                    (
+                        cx_screen - r_dbg,
+                        cy_screen - r_dbg,
+                        cx_screen + r_dbg,
+                        cy_screen + r_dbg,
+                    ),
+                    outline=(255, 0, 255),
+                    width=2,
+                )
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
             # Profils & infos
@@ -1684,7 +1713,6 @@ def render_first_frame_image(
     # --- Constantes identiques à celles de generate_gpx_video ---
     PATCH_FACTOR = 2.4
     MAX_LARGE_DIM = 4096
-    VERTICAL_BIAS = 0.65
 
     graph_font_size = compute_graph_font_size(FONT_SIZE_MEDIUM)
     try:
@@ -1789,8 +1817,6 @@ def render_first_frame_image(
 
     lat_min_raw = float(np.min(lats)); lat_max_raw = float(np.max(lats))
     lon_min_raw = float(np.min(lons)); lon_max_raw = float(np.max(lons))
-    lat_c = (lat_min_raw + lat_max_raw) * 0.5
-    lon_c = (lon_min_raw + lon_max_raw) * 0.5
 
     elev_min = float(np.min(interp_eles))
     elev_max = float(np.max(interp_eles))
@@ -1859,18 +1885,20 @@ def render_first_frame_image(
         x_min = float(np.min(xs_world)); x_max = float(np.max(xs_world))
         y_min = float(np.min(ys_world)); y_max = float(np.max(ys_world))
         track_w = x_max - x_min; track_h = y_max - y_min
+        cx_px = (x_min + x_max) * 0.5
+        cy_px = (y_min + y_max) * 0.5
 
+        lon_c, lat_c = pixel_to_lonlat(cx_px, cy_px, zoom)
 
         patch_w = int(math.ceil(mw * PATCH_FACTOR))
         patch_h = int(math.ceil(mh * PATCH_FACTOR))
         margin_x = patch_w // 2 + 64
         margin_y = patch_h // 2 + 64
-        width_large = int(min(MAX_LARGE_DIM, max(est_w, track_w + 2 * margin_x)))
-        height_large = int(min(MAX_LARGE_DIM, max(est_h, track_h + 2 * margin_y)))
+        width_large = int(min(MAX_LARGE_DIM, max(mw, (x_max - x_min) + 2 * margin_x)))
+        height_large = int(min(MAX_LARGE_DIM, max(mh, (y_max - y_min) + 2 * margin_y)))
 
-        cx, cy = lonlat_to_pixel(lon_c, lat_c, zoom)
-        x0_world = cx - width_large / 2.0
-        y0_world = cy - height_large / 2.0
+        x0_world = cx_px - width_large / 2.0
+        y0_world = cy_px - height_large / 2.0
 
         try:
             base_map_img_large = render_base_map(
@@ -1879,9 +1907,11 @@ def render_first_frame_image(
         except Exception:
             base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
 
-        x_full = xs_world - x0_world
-        y_full = ys_world - y0_world
-        global_xy = np.column_stack((np.rint(x_full).astype(int), np.rint(y_full).astype(int)))
+        xs_local = xs_world - x0_world
+        ys_local = ys_world - y0_world
+        x_full = xs_local
+        y_full = ys_local
+        global_xy = np.column_stack((xs_local, ys_local))
         local_xy_buffer = np.empty_like(global_xy)
 
         headings = []
@@ -1926,12 +1956,12 @@ def render_first_frame_image(
         pdraw = ImageDraw.Draw(patch_img)
         np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
         np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
-        local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
+        local_xy_list = [(float(pt[0]), float(pt[1])) for pt in local_xy_buffer]
         pdraw.line(local_xy_list, fill=map_path_c, width=3)
         pdraw.line(local_xy_list[: current_idx + 1], fill=map_current_path_c, width=4)
         cxp, cyp = local_xy_buffer[current_idx]
         r = 6
-        pdraw.ellipse((int(cxp - r), int(cyp - r), int(cxp + r), int(cyp + r)), fill=map_current_point_c)
+        pdraw.ellipse((cxp - r, cyp - r, cxp + r, cyp + r), fill=map_current_point_c)
 
         speed_kmh0 = float(interp_speeds[current_idx])
         heading_deg = (
@@ -1949,7 +1979,24 @@ def render_first_frame_image(
         view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
         view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
-        frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+        map_x = int(map_area.get("x", 0))
+        map_y = int(map_area.get("y", 0))
+        frame_img.paste(view, (map_x, map_y))
+
+        if DEBUG_ALIGNMENT:
+            cx_screen = map_x + mw // 2
+            cy_screen = map_y + int(VERTICAL_BIAS * mh)
+            r_dbg = 6
+            draw.ellipse(
+                (
+                    cx_screen - r_dbg,
+                    cy_screen - r_dbg,
+                    cx_screen + r_dbg,
+                    cy_screen + r_dbg,
+                ),
+                outline=(255, 0, 255),
+                width=2,
+            )
 
         draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
