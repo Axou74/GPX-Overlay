@@ -479,31 +479,65 @@ def _norm_heading_deg(a: float) -> float:
     return a if a >= 0 else a + 360.0
 
 
-# ---------- WebMercator helpers (clé pour une emprise fiable) ----------
-
+TILE_SIZE = 256
 MERCATOR_LAT_MAX = 85.05112878
+_MERCATOR_MAX_SIN = 1.0 - 1e-15
+
 
 def _clamp_lat(lat: float) -> float:
     return max(-MERCATOR_LAT_MAX, min(MERCATOR_LAT_MAX, lat))
 
+
+def _world_size(zoom: int) -> float:
+    """Return the total size of the WebMercator world in pixels for a zoom level."""
+
+    return float(TILE_SIZE) * (2 ** int(zoom))
+
+
 def lonlat_to_pixel(lon: float, lat: float, zoom: int):
     """Coordonnées pixels monde (x,y) au zoom donné (tuile 256px)."""
+
     lat = _clamp_lat(lat)
-    n = 256 * (2 ** zoom)
+    n = _world_size(zoom)
     x = (lon + 180.0) / 360.0 * n
     siny = math.sin(math.radians(lat))
-    y = (0.5 - math.log((1 + siny) / (1 - siny)) / (4 * math.pi)) * n
+    siny = max(-_MERCATOR_MAX_SIN, min(_MERCATOR_MAX_SIN, siny))
+    log_term = math.log1p(siny) - math.log1p(-siny)
+    y = (0.5 - log_term / (4.0 * math.pi)) * n
     return x, y
 
 
 def lonlat_to_pixel_np(lons, lats, zoom: int):
     """Vectorized lon/lat -> pixel conversion."""
+
     lats = np.clip(lats, -MERCATOR_LAT_MAX, MERCATOR_LAT_MAX)
-    n = 256 * (2 ** zoom)
+    n = _world_size(zoom)
     xs = (lons + 180.0) / 360.0 * n
     siny = np.sin(np.radians(lats))
-    ys = (0.5 - np.log((1 + siny) / (1 - siny)) / (4 * np.pi)) * n
+    siny = np.clip(siny, -_MERCATOR_MAX_SIN, _MERCATOR_MAX_SIN)
+    log_term = np.log1p(siny) - np.log1p(-siny)
+    ys = (0.5 - log_term / (4.0 * np.pi)) * n
     return xs, ys
+
+
+def pixel_to_lonlat(x: float, y: float, zoom: int) -> tuple[float, float]:
+    """Convertit des coordonnées pixels monde en lon/lat (degrés)."""
+
+    n = _world_size(zoom)
+    lon = x / n * 360.0 - 180.0
+    lat_rad = math.pi - (2.0 * math.pi * y / n)
+    lat = math.degrees(math.atan(math.sinh(lat_rad)))
+    return lon, _clamp_lat(lat)
+
+
+def pixel_to_lonlat_np(xs, ys, zoom: int):
+    """Vectorisation de pixel_to_lonlat."""
+
+    n = _world_size(zoom)
+    lons = xs / n * 360.0 - 180.0
+    lat_rad = np.pi - (2.0 * np.pi * ys / n)
+    lats = np.degrees(np.arctan(np.sinh(lat_rad)))
+    return lons, np.clip(lats, -MERCATOR_LAT_MAX, MERCATOR_LAT_MAX)
 
 def bbox_fit_zoom(width_px: int, height_px: int, lon_min, lat_min, lon_max, lat_max, padding_px: int = 0) -> int:
     """Renvoie le zoom entier max qui FAIT TENIR la bbox dans width/height (padding appliqué)."""
