@@ -604,7 +604,15 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
 
     template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
     max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"])
-    center = (lon_c, _clamp_lat(lat_c))
+
+    # L'API ``staticmap`` attend un tuple (latitude, longitude) pour le paramètre
+    # ``center``. La logique interne de l'application manipule partout les
+    # coordonnées dans l'ordre (longitude, latitude) – notamment pour le calcul
+    # des pixels WebMercator. En inversant explicitement l'ordre ici, on garantit
+    # que la carte de fond est centrée sur la même position que celle utilisée
+    # pour projeter la trace GPS, supprimant ainsi le décalage observé entre la
+    # trace et le fond de carte.
+    center = (_clamp_lat(lat_c), lon_c)
 
     def _render_one(url_template):
         s = make_static_map(width, height, url_template, max_zoom=max_zoom)
