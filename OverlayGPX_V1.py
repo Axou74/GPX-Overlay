@@ -1441,7 +1441,8 @@ def generate_gpx_video(
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
         est_h = int(min(MAX_LARGE_DIM, mh * 6))
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+        map_max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM.get("OpenStreetMap", 19))
+        zoom = max(1, min(map_max_zoom, min(19, base_zoom + (zoom_level_ui - 8))))
 
         # Positions "monde" au zoom choisi
         xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
@@ -1852,7 +1853,8 @@ def render_first_frame_image(
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
         est_h = int(min(MAX_LARGE_DIM, mh * 6))
         base_zoom = bbox_fit_zoom(est_w, est_h, lon_min_raw, lat_min_raw, lon_max_raw, lat_max_raw, padding_px=20)
-        zoom = max(1, min(19, base_zoom + (zoom_level_ui - 8)))
+        map_max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM.get("OpenStreetMap", 19))
+        zoom = max(1, min(map_max_zoom, min(19, base_zoom + (zoom_level_ui - 8))))
 
         xs_world, ys_world = lonlat_to_pixel_np(interp_lons, interp_lats, zoom)
 
