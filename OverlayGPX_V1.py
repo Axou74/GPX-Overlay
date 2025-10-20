@@ -185,21 +185,60 @@ def rgb_to_hex(rgb_tuple):
     if isinstance(rgb_tuple, str) and rgb_tuple.startswith("#"):
         return rgb_tuple
     try:
-        r, g, b = rgb_tuple
-        return f"#{int(r):02x}{int(g):02x}{int(b):02x}"
+        components = tuple(int(c) for c in rgb_tuple)
+        if len(components) == 4:
+            r, g, b, a = components
+            return f"#{r:02x}{g:02x}{b:02x}{a:02x}"
+        if len(components) == 3:
+            r, g, b = components
+            return f"#{r:02x}{g:02x}{b:02x}"
     except Exception:
-        return "#000000"
+        pass
+    return "#000000"
+
 
 def hex_to_rgb(value):
     if isinstance(value, tuple):
-        return value
+        return tuple(int(c) for c in value)
     value = value.lstrip('#')
     lv = len(value)
-    return tuple(int(value[i:i + lv // 3], 16) for i in range(0, lv, lv // 3))
+    if lv == 0:
+        return (0, 0, 0)
+    step = lv // 3 if lv not in (4, 8) else lv // 4
+    if step == 0:
+        step = 1
+    comps = tuple(int(value[i:i + step], 16) for i in range(0, lv, step))
+    if len(comps) == 3:
+        return comps
+    if len(comps) == 4:
+        return comps
+    # Fallback si format inattendu
+    return comps[:3]
+
+
+def ensure_color_tuple(color):
+    if isinstance(color, str):
+        return hex_to_rgb(color)
+    if isinstance(color, (list, tuple)):
+        return tuple(int(c) for c in color)
+    raise TypeError(f"Unsupported color type: {type(color)!r}")
+
+
+def color_mode_from_tuple(color_tuple: tuple[int, ...]) -> str:
+    return "RGBA" if len(color_tuple) == 4 else "RGB"
+
+
+def has_transparency(color_tuple: tuple[int, ...]) -> bool:
+    return len(color_tuple) == 4 and color_tuple[3] < 255
+
 
 def darken_color(color, factor=0.7):
-    r, g, b = hex_to_rgb(color)
-    return (int(r * factor), int(g * factor), int(b * factor))
+    comps = ensure_color_tuple(color)
+    r, g, b = comps[:3]
+    dark_rgb = (int(r * factor), int(g * factor), int(b * factor))
+    if len(comps) == 4:
+        return dark_rgb + (comps[3],)
+    return dark_rgb
 
 def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     R = 6371000
@@ -595,12 +634,14 @@ def make_static_map(width: int, height: int, url_template: str, max_zoom: int = 
 
 
 def render_base_map(width: int, height: int, map_style: str, zoom: int,
-                    lon_c: float, lat_c: float, bg_c: tuple[int, int, int],
+                    lon_c: float, lat_c: float, bg_c: tuple[int, ...],
                     fail_on_tile_error: bool = True):
     """Render une carte de fond. Si fail_on_tile_error=True, lève TileFetchError si une tuile échoue."""
+    bg_color = ensure_color_tuple(bg_c)
+    target_mode = color_mode_from_tuple(bg_color)
     if map_style == "Aucun" or not STATICMAP_AVAILABLE:
         from PIL import Image
-        return Image.new("RGB", (width, height), bg_c)
+        return Image.new(target_mode, (width, height), bg_color)
 
     template = MAP_TILE_SERVERS.get(map_style) or MAP_TILE_SERVERS["OpenStreetMap"]
     max_zoom = MAX_ZOOM.get(map_style, MAX_ZOOM["OpenStreetMap"])
@@ -608,19 +649,27 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
 
     def _render_one(url_template):
         s = make_static_map(width, height, url_template, max_zoom=max_zoom)
-        return s.render(zoom=zoom, center=center).convert("RGB")
+        rendered = s.render(zoom=zoom, center=center)
+        if target_mode == "RGBA":
+            return rendered.convert("RGBA")
+        return rendered.convert("RGB")
 
     try:
         if isinstance(template, (list, tuple)):
             # couche de base
-            base_img = _render_one(template[0]).convert("RGBA")
+            base_img = _render_one(template[0])
+            if base_img.mode != "RGBA":
+                base_img = base_img.convert("RGBA")
             # couches additionnelles
             for overlay_url in template[1:]:
-                overlay_img = _render_one(overlay_url).convert("RGBA")
+                overlay_img = _render_one(overlay_url)
+                if overlay_img.mode != "RGBA":
+                    overlay_img = overlay_img.convert("RGBA")
                 base_img.paste(overlay_img, (0, 0), overlay_img)
-            return base_img.convert("RGB")
+            return base_img if target_mode == "RGBA" else base_img.convert(target_mode)
         else:
-            return _render_one(template)
+            img = _render_one(template)
+            return img if img.mode == target_mode else img.convert(target_mode)
     except Exception as e:
         if fail_on_tile_error:
             if not isinstance(e, TileFetchError):
@@ -628,7 +677,7 @@ def render_base_map(width: int, height: int, map_style: str, zoom: int,
             raise e
         # Fallback facultatif (non utilisé si fail_on_tile_error=True)
         from PIL import Image
-        return Image.new("RGB", (width, height), bg_c)
+        return Image.new(target_mode, (width, height), bg_color)
 
 # ---------- Graph helpers ----------
 
@@ -1177,10 +1226,12 @@ def draw_widget_distance(draw, dist_now_m: float, dist_total_m: float, area: dic
 
 
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
-    bg_c = (color_configs.get("background", rgb_to_hex(BG_COLOR)) if color_configs else rgb_to_hex(BG_COLOR))
+    bg_c_raw = color_configs.get("background", rgb_to_hex(BG_COLOR)) if color_configs else rgb_to_hex(BG_COLOR)
+    bg_color = ensure_color_tuple(bg_c_raw)
+    mode = color_mode_from_tuple(bg_color)
     grid_color = (50, 50, 50)
-    img = Image.new("RGB", resolution, bg_c)
-    draw = ImageDraw.Draw(img)
+    img = Image.new(mode, resolution, bg_color)
+    draw = ImageDraw.Draw(img, mode)
     try:
         font_display = ImageFont.truetype(font_path, 16)
     except IOError:
@@ -1241,7 +1292,9 @@ def generate_gpx_video(
         font_medium = ImageFont.load_default()
         font_graph = ImageFont.load_default()
 
-    bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
+    bg_c_raw = color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR
+    bg_c = ensure_color_tuple(bg_c_raw)
+    image_mode = color_mode_from_tuple(bg_c)
     map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
     map_current_path_c = (color_configs.get("map_current_path", CURRENT_PATH_COLOR) if color_configs else CURRENT_PATH_COLOR)
     map_current_point_c = (color_configs.get("map_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
@@ -1433,9 +1486,33 @@ def generate_gpx_video(
         graph_specs,
     )
 
+    ext = os.path.splitext(output_filename)[1].lower()
+    writer_supports_alpha = False
+    if image_mode == "RGBA" and ext in {".webm", ".mkv", ".mov"}:
+        if ext in {".webm", ".mkv"}:
+            writer_kwargs = {
+                "fps": fps,
+                "codec": "libvpx-vp9",
+                "output_params": ["-pix_fmt", "yuva420p"],
+            }
+        else:  # .mov
+            writer_kwargs = {
+                "fps": fps,
+                "codec": "qtrle",
+                "output_params": ["-pix_fmt", "argb"],
+            }
+        writer_supports_alpha = True
+    else:
+        writer_kwargs = {"fps": fps, "codec": "libx264", "macro_block_size": 1}
+        if image_mode == "RGBA" and has_transparency(bg_c):
+            print(
+                "Fond transparent demandé mais le format de sortie ne supporte pas l'alpha. "
+                "Le rendu sera aplati sur un fond opaque."
+            )
+
     try:
 
-        writer = imageio.get_writer(output_filename, fps=fps, codec="libx264", macro_block_size=1)
+        writer = imageio.get_writer(output_filename, **writer_kwargs)
 
         # Calcul du zoom de base (sur grande image), avec offset UI
         est_w = int(min(MAX_LARGE_DIM, mw * 6))
@@ -1469,9 +1546,11 @@ def generate_gpx_video(
             base_map_img_large = render_base_map(
                 width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
             )
+            if base_map_img_large.mode != image_mode:
+                base_map_img_large = base_map_img_large.convert(image_mode)
         except Exception as e:
             print(f"Fond carte non dispo (dyn), fond uni utilisé: {e}")
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+            base_map_img_large = Image.new(image_mode, (width_large, height_large), bg_c)
 
         # Trace dans le repère "large"
         x_full = xs_world - x0_world
@@ -1517,14 +1596,14 @@ def generate_gpx_video(
         for frame_count, global_idx in enumerate(
             range(clip_start_frame, clip_end_frame_exclusive)
         ):
-            frame_img = Image.new("RGB", resolution, bg_c)
-            draw = ImageDraw.Draw(frame_img)
+            frame_img = Image.new(image_mode, resolution, bg_c)
+            draw = ImageDraw.Draw(frame_img, image_mode)
 
             # Patch centré sur le point courant
             xc = float(x_full[global_idx]); yc = float(y_full[global_idx])
             patch_left = int(round(xc - patch_w / 2.0))
             patch_top  = int(round(yc - patch_h / 2.0))
-            patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+            patch_img = Image.new(image_mode, (patch_w, patch_h), bg_c)
 
             src_left   = max(0, patch_left)
             src_top    = max(0, patch_top)
@@ -1532,12 +1611,17 @@ def generate_gpx_video(
             src_bottom = min(base_map_img_large.height, patch_top  + patch_h)
             if src_right > src_left and src_bottom > src_top:
                 crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+                if crop.mode != image_mode:
+                    crop = crop.convert(image_mode)
                 dest_x = src_left - patch_left
                 dest_y = src_top  - patch_top
-                patch_img.paste(crop, (dest_x, dest_y))
+                if image_mode == "RGBA" and crop.mode == "RGBA":
+                    patch_img.paste(crop, (dest_x, dest_y), crop)
+                else:
+                    patch_img.paste(crop, (dest_x, dest_y))
 
             # Trace + progression + point (dans le patch)
-            pdraw = ImageDraw.Draw(patch_img)
+            pdraw = ImageDraw.Draw(patch_img, image_mode)
             np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
             np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
             local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
@@ -1567,7 +1651,11 @@ def generate_gpx_video(
             view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
             # Collage final
-            frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+            paste_xy = (int(map_area.get("x", 0)), int(map_area.get("y", 0)))
+            if image_mode == "RGBA" and view.mode == "RGBA":
+                frame_img.paste(view, paste_xy, view)
+            else:
+                frame_img.paste(view, paste_xy)
             draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
             # Profils & infos
@@ -1646,7 +1734,11 @@ def generate_gpx_video(
                 hr_now = float(interp_hrs[global_idx]) if np.isfinite(interp_hrs[global_idx]) else None
                 draw_pace_hr_text(draw, pace_now, hr_now, info_area, font_medium, text_c)
 
-            writer.append_data(np.array(frame_img))
+            if writer_supports_alpha:
+                frame_to_write = frame_img if frame_img.mode == "RGBA" else frame_img.convert("RGBA")
+            else:
+                frame_to_write = frame_img if frame_img.mode == "RGB" else frame_img.convert("RGB")
+            writer.append_data(np.array(frame_to_write))
             _progress(frame_count + 1)
 
 
@@ -1697,7 +1789,9 @@ def render_first_frame_image(
         font_medium = ImageFont.load_default()
         font_graph = ImageFont.load_default()
 
-    bg_c = (color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR)
+    bg_c_raw = color_configs.get("background", BG_COLOR) if color_configs else BG_COLOR
+    bg_c = ensure_color_tuple(bg_c_raw)
+    image_mode = color_mode_from_tuple(bg_c)
     map_path_c = (color_configs.get("map_path", PATH_COLOR) if color_configs else PATH_COLOR)
     map_current_path_c = (color_configs.get("map_current_path", CURRENT_PATH_COLOR) if color_configs else CURRENT_PATH_COLOR)
     map_current_point_c = (color_configs.get("map_current_point", CURRENT_POINT_COLOR) if color_configs else CURRENT_POINT_COLOR)
@@ -1844,8 +1938,8 @@ def render_first_frame_image(
         graph_specs,
     )
 
-    frame_img = Image.new("RGB", resolution, bg_c)
-    draw = ImageDraw.Draw(frame_img)
+    frame_img = Image.new(image_mode, resolution, bg_c)
+    draw = ImageDraw.Draw(frame_img, image_mode)
     current_idx = clip_start_frame
     heading_deg = 0.0
 
@@ -1878,8 +1972,10 @@ def render_first_frame_image(
             base_map_img_large = render_base_map(
                 width_large, height_large, map_style, zoom, lon_c, lat_c, bg_c, fail_on_tile_error=True
             )
+            if base_map_img_large.mode != image_mode:
+                base_map_img_large = base_map_img_large.convert(image_mode)
         except Exception:
-            base_map_img_large = Image.new("RGB", (width_large, height_large), bg_c)
+            base_map_img_large = Image.new(image_mode, (width_large, height_large), bg_c)
 
         x_full = xs_world - x0_world
         y_full = ys_world - y0_world
@@ -1913,7 +2009,7 @@ def render_first_frame_image(
         yc = float(y_full[current_idx])
         patch_left = int(round(xc - patch_w / 2.0))
         patch_top = int(round(yc - patch_h / 2.0))
-        patch_img = Image.new("RGB", (patch_w, patch_h), bg_c)
+        patch_img = Image.new(image_mode, (patch_w, patch_h), bg_c)
 
         src_left = max(0, patch_left)
         src_top = max(0, patch_top)
@@ -1921,11 +2017,16 @@ def render_first_frame_image(
         src_bottom = min(base_map_img_large.height, patch_top + patch_h)
         if src_right > src_left and src_bottom > src_top:
             crop = base_map_img_large.crop((src_left, src_top, src_right, src_bottom))
+            if crop.mode != image_mode:
+                crop = crop.convert(image_mode)
             dest_x = src_left - patch_left
             dest_y = src_top - patch_top
-            patch_img.paste(crop, (dest_x, dest_y))
+            if image_mode == "RGBA" and crop.mode == "RGBA":
+                patch_img.paste(crop, (dest_x, dest_y), crop)
+            else:
+                patch_img.paste(crop, (dest_x, dest_y))
 
-        pdraw = ImageDraw.Draw(patch_img)
+        pdraw = ImageDraw.Draw(patch_img, image_mode)
         np.subtract(global_xy[:, 0], patch_left, out=local_xy_buffer[:, 0])
         np.subtract(global_xy[:, 1], patch_top, out=local_xy_buffer[:, 1])
         local_xy_list = [(int(pt[0]), int(pt[1])) for pt in local_xy_buffer]
@@ -1951,7 +2052,11 @@ def render_first_frame_image(
         view_top = int(round(patch_h / 2.0 - VERTICAL_BIAS * mh))
         view = patch_img.crop((view_left, view_top, view_left + mw, view_top + mh))
 
-        frame_img.paste(view, (int(map_area.get("x", 0)), int(map_area.get("y", 0))))
+        paste_xy = (int(map_area.get("x", 0)), int(map_area.get("y", 0)))
+        if image_mode == "RGBA" and view.mode == "RGBA":
+            frame_img.paste(view, paste_xy, view)
+        else:
+            frame_img.paste(view, paste_xy)
 
         draw_north_arrow(frame_img, map_area, heading_deg, text_c)
 
