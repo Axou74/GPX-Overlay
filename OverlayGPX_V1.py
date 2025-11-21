@@ -14,7 +14,6 @@ import gpxpy
 import numpy as np
 import pytz
 from PIL import Image, ImageDraw, ImageFont, ImageTk
-from scipy.interpolate import UnivariateSpline
 import xml.etree.ElementTree as ET  # <-- ajouté pour lire la FC dans les extensions GPX
 
 class TileFetchError(Exception):
@@ -54,6 +53,8 @@ DEFAULT_RESOLUTION = (1920, 1080)
 DEFAULT_FPS = 25
 DEFAULT_FONT_PATH = "arial.ttf"
 DEFAULT_CLIP_DURATION_SECONDS = 5
+# Lissage maximum autorisé pour les séries graphiques (secondes)
+MAX_GRAPH_SMOOTHING_SECONDS = 15.0
 
 # Couleurs par défaut
 BG_COLOR = (0, 0, 0)
@@ -321,16 +322,24 @@ def filter_points_by_time(
         total_duration,
     )
 
-def interpolate_data(times, data, interp_times, s: float = 0):
+def interpolate_data(times, data, interp_times):
+    """Interpolation 1D monotone (linéaire) sur des temps croissants uniques."""
+
+    times = np.asarray(times, dtype=float)
+    data = np.asarray(data, dtype=float)
+    interp_times = np.asarray(interp_times, dtype=float)
+
+    if times.size == 0:
+        return np.zeros_like(interp_times, dtype=float)
+
     unique_times, unique_indices = np.unique(times, return_index=True)
     unique_data = data[unique_indices]
-    if len(unique_times) < 2:
-        return np.interp(interp_times, times, data)
-    k_value = min(3, len(unique_times) - 1)
-    if k_value < 1:
-        return np.full_like(interp_times, data[0] if len(data) > 0 else 0)
-    spline = UnivariateSpline(unique_times, unique_data, k=k_value, s=s)
-    return spline(interp_times)
+
+    if unique_times.size == 1:
+        return np.full_like(interp_times, unique_data[0], dtype=float)
+
+    # np.interp impose un vecteur croissant et garantit l'absence d'oscillations
+    return np.interp(interp_times, unique_times, unique_data)
 
 # ---------- Lissage ----------
 
@@ -395,6 +404,13 @@ def prepare_track_arrays(
 
     dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
     cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
+    if len(eles) > 1:
+        raw_seg_slopes = np.where(dists > 0, np.diff(eles) / dists, 0.0) * 100.0
+        raw_slopes = np.insert(
+            raw_seg_slopes, 0, raw_seg_slopes[0] if raw_seg_slopes.size else 0.0
+        )
+    else:
+        raw_slopes = np.zeros_like(eles, dtype=float)
     dt = np.diff(times_seconds)
     segment_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
     if segment_speeds.size:
@@ -411,8 +427,11 @@ def prepare_track_arrays(
         interpolate_data(times_seconds, speeds, interp_times), 0.0, None
     )
     interp_dists = interpolate_data(times_seconds, cum_dists, interp_times)
+    interp_slopes = interpolate_data(times_seconds, raw_slopes, interp_times)
 
-    smoothing_seconds = max(0.0, float(smoothing_seconds))
+    smoothing_seconds = max(
+        0.0, min(float(smoothing_seconds), MAX_GRAPH_SMOOTHING_SECONDS)
+    )
     smoothing_frames = 0
     if fps > 0 and smoothing_seconds > 0.0:
         smoothing_frames = int(round(smoothing_seconds * float(fps)))
@@ -422,16 +441,6 @@ def prepare_track_arrays(
     if smoothing_frames:
         interp_eles = smooth_series(interp_eles, smoothing_frames)
         interp_speeds = smooth_series(interp_speeds, smoothing_frames)
-
-    if len(interp_eles) > 1:
-        dist_interp = haversine_np(
-            interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
-        )
-        elev_diff = np.diff(interp_eles)
-        seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
-        interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
-    else:
-        interp_slopes = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
         interp_slopes = smooth_series(interp_slopes, smoothing_frames)
