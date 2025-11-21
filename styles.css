@@ -90,6 +90,18 @@ header p {
   position: relative;
   overflow: hidden;
   cursor: pointer;
+
+  background: linear-gradient(135deg, #f0b30a, #ff8f3d);
+  color: #1b1b1b;
+  font-weight: 700;
+  border: none;
+  padding-inline: 16px;
+  box-shadow: 0 10px 24px rgba(240, 179, 10, 0.35);
+}
+
+.file-input__text {
+  pointer-events: none;
+
 }
 
 .file-input input {
