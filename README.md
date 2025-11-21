@@ -1,38 +1,26 @@
-# 🗺️ OverlayGPX
+# 🗺️ OverlayGPX (version web)
 
 ## 🎬 Présentation
-OverlayGPX est une application Python qui transforme un fichier GPX en une vidéo MP4 avec carte animée, tracé GPS et données sportives synchronisées (altitude, vitesse, allure, fréquence cardiaque, etc.). L'objectif est d'offrir un rendu prêt à partager, combinant des informations de navigation et des métriques d'entraînement dans une interface entièrement personnalisable.
+Cette version de **OverlayGPX** s'exécute directement dans le navigateur : chargez un fichier GPX, visualisez le tracé sur une carte Leaflet, suivez les métriques synchronisées (vitesse, altitude, allure, fréquence cardiaque, pente) et exportez l'animation en vidéo WebM grâce à l'API `MediaRecorder`.
 
-## ✨ Fonctionnalités détaillées
-- **Carte animée** : téléchargement automatique de tuiles (OpenStreetMap, CyclOSM, Satellite ESRI, etc.), centrage dynamique sur le parcours, affichage de la trace complète et progression du point courant.
-- **Graphiques synchronisés** : profils d'altitude, de vitesse, d'allure (min/km) et de fréquence cardiaque, avec lissage configurable pour un rendu fluide.
-- **Indicateurs temps réel** : bloc d'informations regroupant vitesse instantanée, altitude, heure, pente, allure et fréquence cardiaque, ainsi qu'une jauge de vitesse linéaire ou circulaire.
-- **Orientation et contexte** : boussole animée indiquant le nord, calcul de la rotation de la carte et affichage optionnel d'un ruban directionnel.
-- **Export vidéo** : rendu en MP4 (codec H.264) avec choix de la résolution, des FPS, de la durée du clip et du style visuel pour chaque élément affiché.
-- **Interface Tkinter** : prévisualisation immédiate de la première image, positionnement libre des éléments par glisser-déposer et sauvegarde des configurations d'affichage.
+## ✨ Fonctionnalités principales
+- **Carte animée** : prise en charge de plusieurs fournisseurs de tuiles (OpenStreetMap, ESRI Satellite, CyclOSM, etc.), affichage du tracé complet et d'un marqueur animé.
+- **Graphiques synchronisés** : altitude, vitesse, allure (min/km) et fréquence cardiaque avec lissage configurable.
+- **Indicateurs temps réel** : distance cumulée, heure locale, pente instantanée et jauge de vitesse.
+- **Export vidéo** : capture de la zone de rendu (`captureStream`) pour produire un fichier WebM directement depuis l'interface.
 
-## 🛠️ Dépendances Python
-OverlayGPX repose sur les bibliothèques tierces suivantes :
+## 🚀 Utilisation
+1. Ouvrir `index.html` dans un navigateur moderne (Chrome/Edge/Firefox).
+2. Importer un fichier `.gpx` via le bouton « Charger un fichier GPX ».
+3. Ajuster la durée du clip, le lissage des graphes et le style de carte.
+4. Cliquer sur **Démarrer** pour lancer l'animation, puis éventuellement sur **Exporter en WebM** pour sauvegarder la capture.
 
-| Fonction | Bibliothèque | Installation |
-|----------|--------------|--------------|
-| Lecture GPX | `gpxpy` | `pip install gpxpy` |
-| Calculs scientifiques | `numpy`, `scipy` | `pip install numpy scipy` |
-| Fuseaux horaires | `pytz` | `pip install pytz` |
-| Manipulation d'images | `Pillow`, `imageio` | `pip install pillow imageio` |
-| Tuiles cartographiques *(optionnel)* | `staticmap` | `pip install staticmap` |
+## 📁 Structure du projet
+- `index.html` : layout principal, contrôles et inclusion des dépendances CDN (Leaflet, Chart.js).
+- `styles.css` : thème sombre, grilles d'informations et jauge.
+- `app.js` : parseur GPX, calculs de métriques, animation cartographique, graphes et export vidéo.
+- `OverlayGPX_V1.py` : version Python historique conservée pour référence.
 
-> ℹ️ `staticmap` est uniquement requis si vous souhaitez générer les cartes de fond. Sans cette dépendance, la vidéo peut être produite mais sans couche cartographique.
-
-Les autres modules utilisés (`tkinter`, `json`, `math`, `threading`, etc.) font partie de la bibliothèque standard Python.
-
-## 🚀 Utilisation rapide
-1. Installer les dépendances listées ci-dessus.
-2. Lancer le script principal :
-   ```bash
-   python OverlayGPX_V1.py
-   ```
-3. Charger un fichier GPX via l'interface, ajuster les options (style de carte, couleurs, disposition, FPS) et lancer le rendu vidéo.
-
-## 📄 Licence
-Ce projet est distribué sous licence MIT. Consultez le fichier `LICENSE` si disponible pour plus de détails.
+## 📝 Notes
+- Les fournisseurs de tuiles en ligne nécessitent une connexion Internet lors de l'utilisation.
+- L'export WebM repose sur `MediaRecorder`; certaines versions de Safari peuvent être limitées.
