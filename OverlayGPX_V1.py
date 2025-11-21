@@ -14,6 +14,7 @@ import gpxpy
 import numpy as np
 import pytz
 from PIL import Image, ImageDraw, ImageFont, ImageTk
+from scipy.interpolate import UnivariateSpline
 import xml.etree.ElementTree as ET  # <-- ajouté pour lire la FC dans les extensions GPX
 
 class TileFetchError(Exception):
@@ -53,8 +54,6 @@ DEFAULT_RESOLUTION = (1920, 1080)
 DEFAULT_FPS = 25
 DEFAULT_FONT_PATH = "arial.ttf"
 DEFAULT_CLIP_DURATION_SECONDS = 5
-# Lissage maximum autorisé pour les séries graphiques (secondes)
-MAX_GRAPH_SMOOTHING_SECONDS = 15.0
 
 # Couleurs par défaut
 BG_COLOR = (0, 0, 0)
@@ -63,7 +62,8 @@ CURRENT_PATH_COLOR = (240, 179, 10)
 CURRENT_POINT_COLOR = (255, 0, 0)
 TEXT_COLOR = (255, 255, 255)
 GAUGE_BG_COLOR = (30, 30, 30)
-
+TEXT_STROKE_COLOR = (255, 255, 255)
+TEXT_STROKE_WIDTH = 0
 FONT_SIZE_LARGE = 40
 FONT_SIZE_MEDIUM = 20
 GRAPH_FONT_SCALE = 0.7
@@ -96,6 +96,30 @@ def compute_graph_font_size(medium_size: int) -> int:
 
     scaled_size = int(medium_size * GRAPH_FONT_SCALE)
     return max(MIN_GRAPH_FONT_SIZE, scaled_size)
+
+
+def draw_text_with_stroke(
+    draw: ImageDraw.ImageDraw,
+    position: tuple[float, float],
+    text: str,
+    font,
+    fill: tuple[int, int, int],
+    stroke_fill: tuple[int, int, int] = TEXT_STROKE_COLOR,
+    stroke_width: int = TEXT_STROKE_WIDTH,
+):
+    """Dessine un texte avec une bordure claire pour faciliter le détourage."""
+
+    if stroke_width <= 0:
+        draw.text(position, text, font=font, fill=fill)
+    else:
+        draw.text(
+            position,
+            text,
+            font=font,
+            fill=fill,
+            stroke_width=stroke_width,
+            stroke_fill=stroke_fill,
+        )
 
 DEFAULT_ELEMENT_CONFIGS = {
     "Carte": {
@@ -322,24 +346,16 @@ def filter_points_by_time(
         total_duration,
     )
 
-def interpolate_data(times, data, interp_times):
-    """Interpolation 1D monotone (linéaire) sur des temps croissants uniques."""
-
-    times = np.asarray(times, dtype=float)
-    data = np.asarray(data, dtype=float)
-    interp_times = np.asarray(interp_times, dtype=float)
-
-    if times.size == 0:
-        return np.zeros_like(interp_times, dtype=float)
-
+def interpolate_data(times, data, interp_times, s: float = 0):
     unique_times, unique_indices = np.unique(times, return_index=True)
     unique_data = data[unique_indices]
-
-    if unique_times.size == 1:
-        return np.full_like(interp_times, unique_data[0], dtype=float)
-
-    # np.interp impose un vecteur croissant et garantit l'absence d'oscillations
-    return np.interp(interp_times, unique_times, unique_data)
+    if len(unique_times) < 2:
+        return np.interp(interp_times, times, data)
+    k_value = min(3, len(unique_times) - 1)
+    if k_value < 1:
+        return np.full_like(interp_times, data[0] if len(data) > 0 else 0)
+    spline = UnivariateSpline(unique_times, unique_data, k=k_value, s=s)
+    return spline(interp_times)
 
 # ---------- Lissage ----------
 
@@ -404,13 +420,6 @@ def prepare_track_arrays(
 
     dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
     cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
-    if len(eles) > 1:
-        raw_seg_slopes = np.where(dists > 0, np.diff(eles) / dists, 0.0) * 100.0
-        raw_slopes = np.insert(
-            raw_seg_slopes, 0, raw_seg_slopes[0] if raw_seg_slopes.size else 0.0
-        )
-    else:
-        raw_slopes = np.zeros_like(eles, dtype=float)
     dt = np.diff(times_seconds)
     segment_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
     if segment_speeds.size:
@@ -427,11 +436,8 @@ def prepare_track_arrays(
         interpolate_data(times_seconds, speeds, interp_times), 0.0, None
     )
     interp_dists = interpolate_data(times_seconds, cum_dists, interp_times)
-    interp_slopes = interpolate_data(times_seconds, raw_slopes, interp_times)
 
-    smoothing_seconds = max(
-        0.0, min(float(smoothing_seconds), MAX_GRAPH_SMOOTHING_SECONDS)
-    )
+    smoothing_seconds = max(0.0, float(smoothing_seconds))
     smoothing_frames = 0
     if fps > 0 and smoothing_seconds > 0.0:
         smoothing_frames = int(round(smoothing_seconds * float(fps)))
@@ -441,6 +447,16 @@ def prepare_track_arrays(
     if smoothing_frames:
         interp_eles = smooth_series(interp_eles, smoothing_frames)
         interp_speeds = smooth_series(interp_speeds, smoothing_frames)
+
+    if len(interp_eles) > 1:
+        dist_interp = haversine_np(
+            interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
+        )
+        elev_diff = np.diff(interp_eles)
+        seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
+        interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
+    else:
+        interp_slopes = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
         interp_slopes = smooth_series(interp_slopes, smoothing_frames)
@@ -697,15 +713,27 @@ def create_graph_background_image(
     height = int(draw_area.get("height", 0))
 
     nb_ticks = 2
+    dash_length = max(6, width // 24)
+    gap_length = max(4, dash_length // 2)
     for i in range(nb_ticks + 1):
         val = min_val + (max_val - min_val) * i / nb_ticks
         y = y0 + int((max_val - val) / ((max_val - min_val) + 1e-10) * height)
-        draw.line([(x0, y), (x0 + width, y)], fill=(80, 80, 80), width=1)
+        x = x0
+        while x < x0 + width:
+            x_end = min(x + dash_length, x0 + width)
+            draw.line([(x, y), (x_end, y)], fill=(255, 255, 255), width=2)
+            x += dash_length + gap_length
         val_str = f"{val:.0f}"
         text_bbox = draw.textbbox((0, 0), val_str, font=font)
         text_w = text_bbox[2] - text_bbox[0]
         text_h = text_bbox[3] - text_bbox[1]
-        draw.text((x0 - text_w - 10, y - text_h / 2), val_str, font=font, fill=text_color)
+        draw_text_with_stroke(
+            draw,
+            (x0 - text_w - 10, y - text_h / 2),
+            val_str,
+            font,
+            text_color,
+        )
 
     future_color = darken_color(base_color, 0.8)
     if len(path_coords) >= 2:
@@ -798,12 +826,18 @@ def draw_circular_speedometer(draw, speed, speed_min, speed_max, draw_area, font
     speed_text = f"{speed:.0f}"
     text_bbox = draw.textbbox((0, 0), speed_text, font=font)
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
-    draw.text((cx - text_w/2, y0 + (h - text_h)/2 - 10), speed_text, font=font, fill=text_color)
+    draw_text_with_stroke(
+        draw,
+        (cx - text_w / 2, y0 + (h - text_h) / 2 - 10),
+        speed_text,
+        font,
+        text_color,
+    )
 
 def draw_linear_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     x, y = draw_area["x"], draw_area["y"]
     w, h = draw_area["width"], draw_area["height"]
-    draw.rectangle([x, y, x + w, y + h], outline=gauge_bg_color, width=2)
+    draw.rectangle([x, y, x + w, y + h], outline=(255, 255, 255), width=2)
     fraction = 0.0 if speed_max <= speed_min else (speed - speed_min) / (speed_max - speed_min)
     fraction = max(0.0, min(1.0, fraction))
     col = (0, 255, 0) if fraction < 0.33 else ((255, 255, 0) if fraction < 0.66 else (255, 0, 0))
@@ -812,7 +846,13 @@ def draw_linear_speedometer(draw, speed, speed_min, speed_max, draw_area, font, 
     speed_text = f"{speed:.0f} km/h"
     text_bbox = draw.textbbox((0, 0), speed_text, font=font)
     text_w = text_bbox[2] - text_bbox[0]; text_h = text_bbox[3] - text_bbox[1]
-    draw.text((x + w/2 - text_w/2, y - h*2 - text_h/2), speed_text, font=font, fill=text_color)
+    draw_text_with_stroke(
+        draw,
+        (x + w / 2 - text_w / 2, y - h * 2 - text_h / 2),
+        speed_text,
+        font,
+        text_color,
+    )
 
 def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font, gauge_bg_color, text_color):
     """
@@ -958,7 +998,14 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
                     canv_h = int(th * 2)
                     tmp = Image.new("RGBA", (canv_w, canv_h), (0, 0, 0, 0))
                     td = PILImageDraw.Draw(tmp)
-                    td.text(((canv_w - tw) / 2, (canv_h - th) / 2), label, font=font, fill=col)
+                    td.text(
+                        ((canv_w - tw) / 2, (canv_h - th) / 2),
+                        label,
+                        font=font,
+                        fill=col,
+                        stroke_width=TEXT_STROKE_WIDTH,
+                        stroke_fill=TEXT_STROKE_COLOR,
+                    )
                     rot = ang_deg + 90.0
                     tmp = tmp.rotate(rot, resample=Image.BICUBIC, expand=True)
                     paste_x = int(tx - (tmp.width - tw) / 2)
@@ -967,12 +1014,12 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
                     if base is not None and hasattr(base, "paste"):
                         base.paste(tmp, (paste_x, paste_y), tmp)
                     else:
-                        draw.text((tx, ty), label, font=font, fill=col)
+                        draw_text_with_stroke(draw, (tx, ty), label, font, col)
                 except Exception:
-                    draw.text((tx, ty), label, font=font, fill=col)
+                    draw_text_with_stroke(draw, (tx, ty), label, font, col)
             else:
                 # DROIT (horizontal)
-                draw.text((tx, ty), label, font=font, fill=col)
+                draw_text_with_stroke(draw, (tx, ty), label, font, col)
 
         idx_major += 1
         v += major_step
@@ -989,7 +1036,7 @@ def draw_digital_speedometer(draw, speed, speed_min, speed_max, draw_area, font,
     tx = cx - tw / 2
     ty = cy - radius * 0.25 - th / 2  # "0.25" règle la hauteur relative
 
-    draw.text((tx, ty), speed_text, font=font, fill=text_color)
+    draw_text_with_stroke(draw, (tx, ty), speed_text, font, text_color)
 
     # --- Aiguille + pivot ---
     ang = math.radians(value_to_angle(speed_clamped))
@@ -1005,19 +1052,19 @@ def draw_info_text(draw, speed, altitude, slope, distance_m, current_time, draw_
     base_x = draw_area["x"]
     base_y = draw_area["y"]
     line_step = FONT_SIZE_LARGE + 10
-    draw.text((base_x, base_y), f"Vitesse : {speed:.0f} km/h", font=font, fill=text_color)
-    draw.text((base_x, base_y + line_step), f"Altitude : {altitude:.0f} m", font=font, fill=text_color)
-    draw.text((base_x, base_y + 2 * line_step), f"Distance : {distance_m / 1000.0:.2f} km", font=font, fill=text_color)
-    draw.text((base_x, base_y + 3 * line_step), f"Heure : {display_time}", font=font, fill=text_color)
-    draw.text((base_x, base_y + 4 * line_step), f"Pente : {slope:.1f} %", font=font, fill=text_color)
+    draw_text_with_stroke(draw, (base_x, base_y), f"Vitesse : {speed:.0f} km/h", font, text_color)
+    draw_text_with_stroke(draw, (base_x, base_y + line_step), f"Altitude : {altitude:.0f} m", font, text_color)
+    draw_text_with_stroke(draw, (base_x, base_y + 2 * line_step), f"Distance : {distance_m / 1000.0:.2f} km", font, text_color)
+    draw_text_with_stroke(draw, (base_x, base_y + 3 * line_step), f"Heure : {display_time}", font, text_color)
+    draw_text_with_stroke(draw, (base_x, base_y + 4 * line_step), f"Pente : {slope:.1f} %", font, text_color)
 
 # --- AJOUT : texte allure & FC (dessiné sous les lignes existantes) ---
 def draw_pace_hr_text(draw, pace_minpk, hr_bpm, draw_area, font, text_color):
     y0 = draw_area["y"] + 5 * (FONT_SIZE_LARGE + 10)
     pace_txt = format_pace_mmss(pace_minpk)
     hr_txt = "—" if hr_bpm is None or not np.isfinite(hr_bpm) else f"{hr_bpm:.0f} bpm"
-    draw.text((draw_area["x"], y0), f"Allure : {pace_txt}", font=font, fill=text_color)
-    draw.text((draw_area["x"], y0 + (FONT_SIZE_LARGE + 10)), f"FC : {hr_txt}", font=font, fill=text_color)
+    draw_text_with_stroke(draw, (draw_area["x"], y0), f"Allure : {pace_txt}", font, text_color)
+    draw_text_with_stroke(draw, (draw_area["x"], y0 + (FONT_SIZE_LARGE + 10)), f"FC : {hr_txt}", font, text_color)
 
 def draw_north_arrow(img, map_area, rotation_deg, color):
     size = 40
@@ -1038,7 +1085,7 @@ def draw_north_arrow(img, map_area, rotation_deg, color):
 def draw_compass_tape(draw, heading_deg: float, area: dict, font,
                       text_color,
                       bg_color=None,
-                      tick_color=(230, 230, 230),
+                      tick_color=(255, 255, 255),
                       center_color=(255, 80, 80),
                       stretch_x: float = 2.8,      # étirement horizontal (plus large)
                       gap_above: int = -220,          # espace entre l'arc et le trait rouge
@@ -1146,7 +1193,7 @@ def draw_compass_tape(draw, heading_deg: float, area: dict, font,
             tx, ty = xy_on_ellipse(theta, radius_add = -arc_width * 0.5 + tlen + label_gap)
             tb = draw.textbbox((0, 0), lab, font=font)
             lw, lh = tb[2] - tb[0], tb[3] - tb[1]
-            draw.text((tx - lw / 2, ty - lh / 2), lab, font=font, fill=text_color)
+            draw_text_with_stroke(draw, (tx - lw / 2, ty - lh / 2), lab, font, text_color)
 
     # --- TRAIT ROUGE vertical juste au-dessus de l'arc ---
     # Bord supérieur de l'ellipse + demi-épaisseur de trait de l'arc
@@ -1182,7 +1229,7 @@ def draw_widget_distance(draw, dist_now_m: float, dist_total_m: float, area: dic
     tw = tb[2]-tb[0]; th = tb[3]-tb[1]
     tx = bar_x0 + (bar_w - tw)//2
     ty = bar_y0 + (bar_h - th)//2
-    draw.text((tx, ty), label, font=font, fill=text_color)
+    draw_text_with_stroke(draw, (tx, ty), label, font, text_color)
 
 
 def generate_preview_image(resolution, font_path, element_configs, color_configs=None) -> Image.Image:
