@@ -147,38 +147,36 @@ function updateBaseLayer() {
 async function handleFile(event) {
   const file = event.target.files?.[0];
   if (!file) return;
-  try {
-    const text = await file.text();
-    state.data = parseGpx(text);
-    document.querySelector("#fileInputLabel .file-input__text").textContent = file.name;
-    if (!state.data.length) {
-      alert("Aucune donnée GPX lisible");
-      return;
-    }
-    updateMapLayers();
-    updateChartsData();
-    updateIndicators(state.data[0], 0);
-    controls.playBtn.disabled = false;
-    controls.resetBtn.disabled = false;
-    controls.recordBtn.disabled = false;
-    controls.playBtn.focus();
-  } catch (err) {
-    console.error(err);
-    alert("Erreur lors du chargement du fichier GPX.");
+
+  const text = await file.text();
+  state.data = parseGpx(text);
+  if (!state.data.length) {
+    alert("Aucune donnée GPX lisible");
+    return;
   }
+  updateMapLayers();
+  updateChartsData();
+  controls.playBtn.disabled = false;
+  controls.resetBtn.disabled = false;
+  controls.recordBtn.disabled = false;
+
 }
 
 function parseGpx(text) {
   const xml = new DOMParser().parseFromString(text, "text/xml");
   const points = Array.from(xml.getElementsByTagName("trkpt"));
+
   const routePoints = Array.from(xml.getElementsByTagName("rtept"));
   const segments = points.length ? points : routePoints;
   if (!segments.length) return [];
+
   const samples = [];
   let cumulativeDistance = 0;
   let startTime = null;
 
+
   segments.forEach((pt, idx) => {
+
     const lat = parseFloat(pt.getAttribute("lat"));
     const lon = parseFloat(pt.getAttribute("lon"));
     const eleNode = pt.getElementsByTagName("ele")[0];
