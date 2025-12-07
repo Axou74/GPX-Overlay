@@ -246,48 +246,97 @@ def haversine_np(lat1, lon1, lat2, lon2):
     return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1 - a))
 
 def parse_gpx(filepath: str):
+    """
+    Lit un fichier GPX et renvoie :
+      - une liste de dicts {"time", "lat", "lon", "ele", "hr"}
+      - l'heure de début
+      - l'heure de fin
+
+    Les datetimes sont forcés en timezone-aware (UTC si absent).
+    Les points incomplets ou manifestement aberrants sont ignorés.
+    """
     points = []
     gpx_start_time = None
     gpx_end_time = None
+
     try:
         with open(filepath, "r", encoding="utf-8") as f:
             gpx = gpxpy.parse(f)
-
-        points_iter = (
-            pt
-            for track in gpx.tracks
-            for segment in track.segments
-            for pt in segment.points
-        )
-        for point in points_iter:
-            if (
-                point.time
-                and point.latitude is not None
-                and point.longitude is not None
-                and point.elevation is not None
-            ):
-                hr_val = None
-                for ext in getattr(point, "extensions", []):
-                    hr_node = ext.find('.//{*}hr')
-                    if hr_node is not None and hr_node.text:
-                        hr_val = float(hr_node.text.strip())
-                        break
-                points.append(
-                    {
-                        "time": point.time,
-                        "lat": point.latitude,
-                        "lon": point.longitude,
-                        "ele": point.elevation,
-                        "hr": hr_val,
-                    }
-                )
-        if points:
-            gpx_start_time = points[0]["time"]
-            gpx_end_time = points[-1]["time"]
     except Exception as e:
-        print(f"Erreur GPX: {e}")
+        print(f"Erreur GPX ({filepath}): {e}")
         return [], None, None
+
+    # Itération sur tous les points
+    points_iter = (
+        pt
+        for track in gpx.tracks
+        for segment in track.segments
+        for pt in segment.points
+    )
+
+    for point in points_iter:
+        t = getattr(point, "time", None)
+        lat = getattr(point, "latitude", None)
+        lon = getattr(point, "longitude", None)
+        ele = getattr(point, "elevation", None)
+
+        # On ne garde que les points complets
+        if t is None or lat is None or lon is None or ele is None:
+            continue
+
+        # On force des float
+        try:
+            lat = float(lat)
+            lon = float(lon)
+            ele = float(ele)
+        except (TypeError, ValueError):
+            continue
+
+        # Filtrage grossier géographique
+        if not (-90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+            continue
+
+        # Normalisation timezone : on force un datetime aware
+        if t.tzinfo is None:
+            # Les GPX sont normalement en UTC ; si tz manquant, on suppose UTC.
+            t = pytz.UTC.localize(t)
+
+        # FC éventuelle dans les extensions
+        hr_val = None
+        try:
+            exts = getattr(point, "extensions", []) or []
+            for ext in exts:
+                hr_node = ext.find(".//{*}hr")
+                if hr_node is not None and hr_node.text:
+                    try:
+                        hr_val = float(hr_node.text.strip())
+                    except ValueError:
+                        hr_val = None
+                    break
+        except Exception:
+            # En cas de format exotique dans les extensions, on ignore la FC
+            hr_val = None
+
+        points.append(
+            {
+                "time": t,
+                "lat": lat,
+                "lon": lon,
+                "ele": ele,
+                "hr": hr_val,
+            }
+        )
+
+    if not points:
+        return [], None, None
+
+    # Sécurité : tri par temps au cas où
+    points.sort(key=lambda p: p["time"])
+    gpx_start_time = points[0]["time"]
+    gpx_end_time = points[-1]["time"]
+
     return points, gpx_start_time, gpx_end_time
+
 
 def filter_points_by_time(
     points,
@@ -297,20 +346,58 @@ def filter_points_by_time(
     pre_margin_seconds: float = 0.0,
     post_margin_seconds: float = 0.0,
 ):
-    tz = pytz.timezone(timezone_str)
-    clip_start = tz.localize(datetime.fromisoformat(start_time_str))
+    """
+    Filtre les points GPX sur une fenêtre temporelle :
+      - start_time_str : datetime ISO (naïf, sans tz) dans le fuseau timezone_str
+      - duration_seconds : durée du clip
+      - pre_margin_seconds / post_margin_seconds : marges avant/après le clip
 
+    Renvoie :
+      - liste de points filtrés
+      - datetime extended_start (début de la fenêtre élargie)
+      - objet timezone tz
+      - offset clip_start (s) dans la fenêtre élargie
+      - offset clip_end (s) dans la fenêtre élargie
+      - durée totale de la fenêtre élargie (s)
+    """
     if not points:
         raise ValueError("Aucun point GPX disponible.")
 
+    # timezone_str peut être un nom de fuseau ou déjà un objet tz
+    if isinstance(timezone_str, str):
+        tz = pytz.timezone(timezone_str)
+    else:
+        tz = timezone_str
+
+    # start_time_str est naïf -> on le localise dans le fuseau tz
+    try:
+        clip_start_local_naive = datetime.fromisoformat(start_time_str)
+    except Exception as e:
+        raise ValueError(f"Format de date de départ invalide : {e}")
+
+    clip_start = tz.localize(clip_start_local_naive)
+
+    # Conversion des temps GPX dans le fuseau
     tz_times = [pt["time"].astimezone(tz) for pt in points]
     earliest_time = min(tz_times)
     latest_time = max(tz_times)
 
+    # On impose que le début de clip soit dans la trace
+    if clip_start < earliest_time or clip_start > latest_time:
+        raise ValueError(
+            "Le début du clip est en dehors de l'intervalle temporel du GPX."
+        )
+
+    # Fin de clip demandée
+    duration_seconds = max(0.0, float(duration_seconds))
     clip_end = clip_start + timedelta(seconds=duration_seconds)
+
+    # Comportement : si le clip dépasse la fin du GPX, on lève une erreur
+    # (tu peux changer en 'clip_end = min(clip_end, latest_time)' si tu préfères le clamp).
     if clip_end > latest_time:
         raise ValueError("La durée du clip dépasse la fin du GPX.")
 
+    # Marges
     pre_margin = max(0.0, float(pre_margin_seconds))
     post_margin = max(0.0, float(post_margin_seconds))
 
@@ -345,6 +432,7 @@ def filter_points_by_time(
         clip_end_offset,
         total_duration,
     )
+
 
 def interpolate_data(times, data, interp_times, s: float = 0):
     unique_times, unique_indices = np.unique(times, return_index=True)
@@ -416,19 +504,64 @@ def prepare_track_arrays(
     fps,
     smoothing_seconds: float = DEFAULT_GRAPH_SMOOTHING_SECONDS,
 ):
-    """Pré-calcul des séries interpolées communes aux rendus avec lissage optionnel."""
+    """
+    Pré-calcul des séries interpolées communes aux rendus avec lissage optionnel.
 
+    Entrées :
+      - times_seconds : temps (s) relatifs à extended_start
+      - lats, lons, eles : séries brutes (points filtrés)
+      - hrs_raw : FC brute (peut contenir des NaN)
+      - total_duration_seconds : durée totale (fenêtre élargie)
+      - fps : images/seconde
+      - smoothing_seconds : durée de la fenêtre de lissage
+
+    Sortie : dict avec séries interpolées :
+      interp_times, interp_lats, interp_lons, interp_eles,
+      interp_speeds, interp_slopes, interp_pace, interp_hrs, interp_dists,
+      total_frames, duration_seconds
+    """
+    times_seconds = np.asarray(times_seconds, dtype=float)
+    lats = np.asarray(lats, dtype=float)
+    lons = np.asarray(lons, dtype=float)
+    eles = np.asarray(eles, dtype=float)
+    hrs_raw = np.asarray(hrs_raw, dtype=float)
+
+    if times_seconds.size < 2:
+        # Cas pathologique : on renvoie des tableaux très simples
+        total_frames = max(1, int(max(total_duration_seconds, 0.0) * fps))
+        interp_times = np.linspace(0.0, float(total_duration_seconds), num=total_frames, endpoint=False)
+        zero = np.zeros_like(interp_times)
+        nan = np.full_like(interp_times, np.nan, dtype=float)
+        return {
+            "total_frames": total_frames,
+            "duration_seconds": float(total_duration_seconds),
+            "interp_times": interp_times,
+            "interp_lats": zero,
+            "interp_lons": zero,
+            "interp_eles": zero,
+            "interp_speeds": zero,
+            "interp_slopes": zero,
+            "interp_pace": np.full_like(interp_times, np.inf, dtype=float),
+            "interp_hrs": nan,
+            "interp_dists": zero,
+        }
+
+    # Distances brutes & distance cumulée
     dists = haversine_np(lats[:-1], lons[:-1], lats[1:], lons[1:])
     cum_dists = np.insert(np.cumsum(dists), 0, 0.0)
+
+    # Vitesses (km/h)
     dt = np.diff(times_seconds)
     segment_speeds = np.where(dt > 0, (dists / dt) * 3.6, 0.0)
     if segment_speeds.size:
         speeds = np.insert(segment_speeds, 0, segment_speeds[0])
     else:
-        speeds = np.array([0.0])
+        speeds = np.array([0.0], dtype=float)
 
-    total_frames = max(1, int(total_duration_seconds * fps))
+    total_frames = max(1, int(max(total_duration_seconds, 0.0) * fps))
     interp_times = np.linspace(0.0, float(total_duration_seconds), num=total_frames, endpoint=False)
+
+    # Interpolations spline
     interp_lats = interpolate_data(times_seconds, lats, interp_times)
     interp_lons = interpolate_data(times_seconds, lons, interp_times)
     interp_eles = interpolate_data(times_seconds, eles, interp_times)
@@ -437,6 +570,7 @@ def prepare_track_arrays(
     )
     interp_dists = interpolate_data(times_seconds, cum_dists, interp_times)
 
+    # Paramètre de lissage en frames
     smoothing_seconds = max(0.0, float(smoothing_seconds))
     smoothing_frames = 0
     if fps > 0 and smoothing_seconds > 0.0:
@@ -444,27 +578,34 @@ def prepare_track_arrays(
         if smoothing_frames < 2:
             smoothing_frames = 0
 
+    # Lissage altitude / vitesse
     if smoothing_frames:
         interp_eles = smooth_series(interp_eles, smoothing_frames)
         interp_speeds = smooth_series(interp_speeds, smoothing_frames)
 
+    # Pente (%)
     if len(interp_eles) > 1:
         dist_interp = haversine_np(
             interp_lats[:-1], interp_lons[:-1], interp_lats[1:], interp_lons[1:]
         )
         elev_diff = np.diff(interp_eles)
         seg_slopes = np.where(dist_interp > 0, elev_diff / dist_interp, 0.0) * 100.0
-        interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0] if seg_slopes.size else 0.0)
+        if seg_slopes.size:
+            interp_slopes = np.insert(seg_slopes, 0, seg_slopes[0])
+        else:
+            interp_slopes = np.zeros_like(interp_eles)
     else:
         interp_slopes = np.zeros_like(interp_eles)
 
     if smoothing_frames and interp_slopes.size:
         interp_slopes = smooth_series(interp_slopes, smoothing_frames)
 
+    # Allure (min/km), avec inf pour vitesses très faibles
     interp_pace = np.where(interp_speeds > 0.05, 60.0 / interp_speeds, np.inf)
     if smoothing_frames and interp_pace.size:
         interp_pace = smooth_series(interp_pace, smoothing_frames)
 
+    # FC interpolée
     finite_hr_count = int(np.isfinite(hrs_raw).sum())
     if finite_hr_count >= 2:
         mask = np.isfinite(hrs_raw)
@@ -491,6 +632,7 @@ def prepare_track_arrays(
         "interp_hrs": interp_hrs,
         "interp_dists": interp_dists,
     }
+
 
 
 def format_hms(seconds: int) -> str:
